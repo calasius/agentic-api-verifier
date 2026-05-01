@@ -1,0 +1,10 @@
+.venv/
+.codex
+__pycache__/
+*.pyc
+.ruff_cache/
+findings/candidates-*.json
+findings/verified-*.json
+findings/demo-run-*.json
+findings/runs/*.json
+crAPI/

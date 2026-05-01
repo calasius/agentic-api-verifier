@@ -1,0 +1,37 @@
+{
+  "target": "crAPI",
+  "service": "identity",
+  "source": "cache",
+  "findings": [
+    {
+      "id": "f-001",
+      "service": "identity",
+      "file": "services/identity/src/main/java/com/crapi/controller/UserController.java",
+      "line": 142,
+      "vulnerability_type": "BOLA / IDOR",
+      "owasp_api_category": "API1:2023",
+      "hypothesis": "An authenticated user can request another user's object by changing an identifier because the endpoint validates authentication but does not bind the requested object to the JWT subject.",
+      "confidence_initial": 0.86
+    },
+    {
+      "id": "f-002",
+      "service": "identity",
+      "file": "services/identity/src/main/java/com/crapi/controller/VehicleController.java",
+      "line": 87,
+      "vulnerability_type": "Broken Object Property Level Authorization",
+      "owasp_api_category": "API3:2023",
+      "hypothesis": "A vehicle-related response returns fields from an internal object without filtering them by the caller's authorization context.",
+      "confidence_initial": 0.78
+    },
+    {
+      "id": "f-003",
+      "service": "identity",
+      "file": "services/identity/src/main/java/com/crapi/dto/UserProfile.java",
+      "line": 51,
+      "vulnerability_type": "Mass Assignment",
+      "owasp_api_category": "API3:2023",
+      "hypothesis": "A profile update DTO appears to expose writable fields that may map to security-sensitive account properties without server-side allow-listing.",
+      "confidence_initial": 0.63
+    }
+  ]
+}
