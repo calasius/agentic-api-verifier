@@ -1,0 +1,37 @@
+{
+  "target": "crAPI",
+  "service": "identity",
+  "source": "scanner-seeded",
+  "findings": [
+    {
+      "id": "known-001",
+      "service": "identity",
+      "file": "services/identity/src/main/java/com/crapi/controller/VehicleController.java",
+      "line": 121,
+      "vulnerability_type": "BOLA / IDOR",
+      "owasp_api_category": "API1:2023",
+      "hypothesis": "GET /identity/api/v2/vehicle/{carId}/location accepts a vehicle UUID and delegates to VehicleServiceImpl.getVehicleLocation without passing the authenticated request or checking that the caller owns the vehicle. If an authenticated user obtains another user's vehicle UUID, the endpoint may return the owner's name, email, and vehicle location.",
+      "confidence_initial": 0.92
+    },
+    {
+      "id": "known-002",
+      "service": "identity",
+      "file": "services/identity/src/main/java/com/crapi/service/Impl/UserServiceImpl.java",
+      "line": 212,
+      "vulnerability_type": "JWT invalid signature acceptance",
+      "owasp_api_category": "API2:2023",
+      "hypothesis": "The dashboard flow explicitly calls getUserFromTokenWithoutValidation and comments that it is not checking token validity. A forged JWT with a different subject may be accepted by the dashboard endpoint and expose that user's dashboard data.",
+      "confidence_initial": 0.9
+    },
+    {
+      "id": "known-003",
+      "service": "identity",
+      "file": "services/identity/src/main/java/com/crapi/config/JwtProvider.java",
+      "line": 170,
+      "vulnerability_type": "JWT algorithm confusion / JKU misuse",
+      "owasp_api_category": "API2:2023",
+      "hypothesis": "JwtProvider.validateJwtToken accepts HS256 tokens using a secret derived from the RSA public key, accepts a special kid containing /dev/null as AA==, and can load verification keys from the token's jku header. A forged token may be accepted as valid.",
+      "confidence_initial": 0.88
+    }
+  ]
+}

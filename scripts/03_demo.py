@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shlex
 import shutil
 from pathlib import Path
 
 import httpx
 import typer
-from common import DEFAULT_TARGET_URL, FINDINGS_DIR, ROOT, timestamp
+from common import (
+    DEFAULT_TARGET_URL,
+    FINDINGS_DIR,
+    ROOT,
+    CommandTimeoutError,
+    RunRecorder,
+    timestamp,
+)
 from models import FindingSet, VerificationSet
 from rich.console import Console
 from rich.panel import Panel
@@ -15,6 +24,10 @@ from rich.table import Table
 
 app = typer.Typer(help="Run the end-to-end Strike demo.")
 console = Console()
+
+
+def log(stage: str, message: str) -> None:
+    console.print(f"[dim]{timestamp()}[/] [cyan]{stage}[/] {message}")
 
 
 def load_function(script_name: str, function_name: str):
@@ -42,9 +55,11 @@ def check_target(target_url: str, from_cache: bool) -> str:
         return f"UNREACHABLE: {exc}"
 
 
-def preflight(target_url: str, from_cache: bool, runtime: str, image: str) -> bool:
+def preflight(
+    target_url: str, from_cache: bool, runtime: str, image: str, llm: str
+) -> str | None:
     if from_cache:
-        return True
+        return check_target(target_url, from_cache=True)
 
     ok = True
     crapi_dir = ROOT / "crAPI"
@@ -53,8 +68,39 @@ def preflight(target_url: str, from_cache: bool, runtime: str, image: str) -> bo
         console.print("Run: git clone https://github.com/OWASP/crAPI.git")
         ok = False
 
-    if not shutil.which("codex"):
-        console.print("[red]Missing Codex CLI:[/] codex is not in PATH")
+    if llm == "claude":
+        configured = os.environ.get("CLAUDE_COMMAND")
+        parts = shlex.split(configured) if configured else ["claude"]
+        launcher = parts[0]
+        if not shutil.which(launcher):
+            console.print(f"[red]Missing Claude launcher:[/] {launcher} is not in PATH")
+            console.print("Install: https://docs.anthropic.com/en/docs/claude-code/quickstart")
+            ok = False
+        elif configured:
+            console.print(f"Claude command: {configured}")
+        configured_flags = os.environ.get("CLAUDE_EXEC_FLAGS")
+        if configured_flags:
+            console.print(f"Claude exec flags: {configured_flags}")
+    elif llm == "codex":
+        configured = os.environ.get("CODEX_COMMAND")
+        parts = shlex.split(configured) if configured else ["codex"]
+        launcher = parts[0]
+        if not shutil.which(launcher):
+            console.print(f"[red]Missing Codex launcher:[/] {launcher} is not in PATH")
+            ok = False
+        elif configured:
+            console.print(f"Codex command: {configured}")
+        elif not shutil.which("node"):
+            console.print("[red]Missing Node.js:[/] node is not in PATH")
+            console.print("Fedora install: sudo dnf install -y nodejs")
+            console.print("Toolbox alternative: CODEX_COMMAND='toolbox run codex'")
+            console.print("Then verify: node --version")
+            ok = False
+        configured_flags = os.environ.get("CODEX_EXEC_FLAGS")
+        if configured_flags:
+            console.print(f"Codex exec flags: {configured_flags}")
+    else:
+        console.print(f"[red]Unknown LLM provider:[/] {llm} (expected 'claude' or 'codex')")
         ok = False
 
     runtime_path = shutil.which(runtime)
@@ -75,11 +121,13 @@ def preflight(target_url: str, from_cache: bool, runtime: str, image: str) -> bo
         )
         console.print(
             "Run: cd crAPI/deploy/docker && "
-            "podman compose -f docker-compose.yml --compatibility up -d"
+            "podman compose -f docker-compose.yml up -d"
         )
         ok = False
 
-    return ok
+    if not ok:
+        return None
+    return health
 
 
 def print_candidates(finding_set: FindingSet) -> None:
@@ -149,17 +197,35 @@ def main(
     max_findings: int = 3,
     target_url: str = DEFAULT_TARGET_URL,
     from_cache: bool = False,
+    candidates: Path | None = None,
     no_pause: bool = False,
-    model: str = "gpt-5.5",
+    model: str = "claude-sonnet-4-6",
+    detect_timeout: int = 900,
+    codex_timeout: int = 900,
+    poc_provider: str = "codex",
     runtime: str = "podman",
     image: str = "strike-demo/poc-runner:latest",
+    llm: str = "claude",
 ) -> None:
     pause_enabled = not no_pause
+    recorder = RunRecorder()
     run_record: dict[str, object] = {
+        "run_id": recorder.run_id,
         "service": service,
         "target_url": target_url,
         "from_cache": from_cache,
+        "candidates": str(candidates) if candidates else None,
     }
+    recorder.update(
+        service=service,
+        target_url=target_url,
+        from_cache=from_cache,
+        candidates=str(candidates) if candidates else None,
+        model=model,
+        max_findings=max_findings,
+        poc_provider=poc_provider,
+        llm=llm,
+    )
 
     console.print(
         Panel(
@@ -170,37 +236,91 @@ def main(
     )
     pause(pause_enabled)
 
-    if not preflight(target_url=target_url, from_cache=from_cache, runtime=runtime, image=image):
+    log("preflight", "Checking local prerequisites")
+    recorder.event("preflight.start", "Checking local prerequisites")
+    health = preflight(
+        target_url=target_url, from_cache=from_cache, runtime=runtime, image=image, llm=llm
+    )
+    if health is None:
+        recorder.event("preflight.failed", "Preflight failed")
         raise typer.Exit(1)
 
-    health = check_target(target_url, from_cache)
-    console.print(f"Target check: {health}")
     run_record["target_check"] = health
+    recorder.update(target_check=health)
+    recorder.event("preflight.done", "Preflight completed", target_check=health)
     pause(pause_enabled)
 
-    detect = load_function("01_detect.py", "detect")
-    candidates_path = detect(
-        service=service,
-        max_findings=max_findings,
-        model=model,
-        from_cache=from_cache,
-    )
+    if candidates:
+        log("candidates", f"Loading seeded candidates from {candidates}")
+        recorder.event("candidates.load.start", "Loading seeded candidates", path=str(candidates))
+        candidates_path = candidates
+        if not candidates_path.exists():
+            console.print(f"[red]Candidates file does not exist:[/] {candidates_path}")
+            recorder.event("candidates.load.failed", "Candidates file does not exist")
+            raise typer.Exit(1)
+    else:
+        log("detect", f"Starting {llm} detection with timeout={detect_timeout}s")
+        recorder.event(
+            "detect.start", f"Starting {llm} detection", timeout=detect_timeout, llm=llm
+        )
+        detect = load_function("01_detect.py", "detect")
+        try:
+            candidates_path = detect(
+                service=service,
+                max_findings=max_findings,
+                model=model,
+                from_cache=from_cache,
+                timeout=detect_timeout,
+                llm=llm,
+            )
+        except CommandTimeoutError as exc:
+            console.print(f"[red]{exc}[/]")
+            console.print("Try increasing detection timeout with: --detect-timeout 1800")
+            recorder.event("detect.timeout", str(exc), timeout=exc.timeout)
+            raise typer.Exit(1) from exc
     finding_set = FindingSet.model_validate_json(candidates_path.read_text())
+    log("candidates", f"Loaded {len(finding_set.findings)} candidate finding(s)")
     print_candidates(finding_set)
     run_record["candidates_path"] = str(candidates_path)
+    recorder.update(candidates_path=str(candidates_path))
+    recorder.event(
+        "candidates.loaded",
+        "Candidate findings loaded",
+        count=len(finding_set.findings),
+        path=str(candidates_path),
+    )
     pause(pause_enabled)
 
     verify = load_function("02_verify.py", "verify")
-    verified_path = verify(
-        input_path=candidates_path,
-        target_url=target_url,
-        max_findings=max_findings,
-        from_cache=from_cache,
-        model=model,
-        image=image,
-        runtime=runtime,
-    )
+    log("verify", f"Starting verification for up to {max_findings} finding(s)")
+    recorder.event("verify.start", "Starting verification", max_findings=max_findings)
+
+    def on_verify_event(stage: str, message: str, details: dict) -> None:
+        log(stage, message)
+        recorder.event(stage, message, **details)
+
+    try:
+        verified_path = verify(
+            input_path=candidates_path,
+            target_url=target_url,
+            max_findings=max_findings,
+            from_cache=from_cache,
+            model=model,
+            codex_timeout=codex_timeout,
+            poc_provider=poc_provider,
+            image=image,
+            runtime=runtime,
+            llm=llm,
+            on_event=on_verify_event,
+            on_partial=recorder.partial,
+        )
+    except CommandTimeoutError as exc:
+        console.print(f"[red]{exc}[/]")
+        console.print("Try increasing PoC-generation timeout with: --codex-timeout 1800")
+        recorder.event("verify.timeout", str(exc), timeout=exc.timeout)
+        raise typer.Exit(1) from exc
     verification_set = VerificationSet.model_validate_json(verified_path.read_text())
+    recorder.event("verify.done", "Verification completed", path=str(verified_path))
     print_verification(verification_set)
     pause(pause_enabled)
 
@@ -208,10 +328,13 @@ def main(
     run_record["verified_path"] = str(verified_path)
     run_record["metrics"] = metrics
     run_record["findings"] = json.loads(verification_set.model_dump_json())["findings"]
+    recorder.update(verified_path=str(verified_path), metrics=metrics, status="completed")
 
     output = FINDINGS_DIR / f"demo-run-{timestamp()}.json"
     output.write_text(json.dumps(run_record, indent=2) + "\n")
+    recorder.update(demo_run_path=str(output))
     console.print(f"Run record: {output}")
+    console.print(f"Partial run log: {recorder.path}")
 
 
 if __name__ == "__main__":

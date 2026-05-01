@@ -13,6 +13,14 @@ class VerificationStatus(StrEnum):
     unclear = "UNCLEAR"
 
 
+class AttackRequest(BaseModel):
+    method: str
+    path: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    body: Any | None = None
+    notes: str | None = None
+
+
 class Finding(BaseModel):
     id: str
     service: str
@@ -22,6 +30,11 @@ class Finding(BaseModel):
     owasp_api_category: str | None = None
     hypothesis: str
     confidence_initial: float = Field(ge=0, le=1)
+    victim_identity: str | None = None
+    attack_request: AttackRequest | None = None
+    expected_response_signal: str | None = None
+    setup_state: str | None = None
+    target_state_required: str | None = None
 
 
 class FindingSet(BaseModel):

