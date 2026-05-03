@@ -84,6 +84,32 @@ verdicts/<id>.json   # one per finding from exploiter
 opencode-serve.log
 ```
 
+## Watching progress live
+
+In a second terminal, while `run.sh` is going:
+
+```bash
+opencode/watch.sh                  # auto-detect the active phase
+opencode/watch.sh surveyor         # surveyor only
+opencode/watch.sh hunter           # hunter only
+opencode/watch.sh exploiter        # the per-finding exploiter loop
+opencode/watch.sh --run 20260503-072300   # specific past run
+```
+
+The watcher pretty-prints the JSON-line stream:
+- `⚙ <tool> :: <input>` tool call (Read/Grep/Bash/MCP/...)
+- `   ↳ <output>` tool result excerpt
+- `💬 <text>` text chunk from the assistant
+- `✓ step_finish  cost=$…  in=… out=…  cache_read=…` per-step usage
+
+If you prefer the native opencode TUI:
+
+```bash
+opencode attach http://localhost:4096 --dir <workspace>
+```
+
+The TUI lists active sessions; pick the one you want to follow.
+
 ## How the agents are wired
 
 The agent markdown files declare their permission rules in YAML frontmatter:
