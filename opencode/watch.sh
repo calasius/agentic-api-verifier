@@ -17,13 +17,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNS_DIR="$REPO_ROOT/findings/opencode-runs"
 PORT="${OPENCODE_PORT:-4096}"
+PORT_EXPLICIT=0
 PHASE=""
 RUN_TS=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --run)              RUN_TS="$2"; shift 2 ;;
-        --port)             PORT="$2"; shift 2 ;;
+        --port)             PORT="$2"; PORT_EXPLICIT=1; shift 2 ;;
         -h|--help)          sed -n '2,16p' "$0" >&2; exit 0 ;;
         surveyor|hunter|exploiter)
                             PHASE="$1"; shift ;;
@@ -83,12 +84,22 @@ if [[ -z "$SID" ]]; then
     exit 1
 fi
 
-# ─── ask the server for the session's working directory ──────────────────
+# If --port wasn't explicit, auto-detect the port from the run's
+# opencode-serve.log (the line "opencode server listening on http://…:N").
+if [[ "$PORT_EXPLICIT" -eq 0 && -f "$RUN/opencode-serve.log" ]]; then
+    DETECTED="$(grep -oE 'listening on http://[^:]+:[0-9]+' "$RUN/opencode-serve.log" \
+                 | grep -oE '[0-9]+$' | head -1 || true)"
+    if [[ -n "$DETECTED" ]]; then
+        PORT="$DETECTED"
+    fi
+fi
+
 URL="http://localhost:$PORT"
 SESSION_JSON="$(curl -fsS "$URL/session/$SID" 2>/dev/null || true)"
 if [[ -z "$SESSION_JSON" ]]; then
     echo "Could not reach opencode serve at $URL." >&2
-    echo "Is the run still going? If you used --port, pass it here too." >&2
+    echo "Tried port $PORT (auto-detected from $RUN/opencode-serve.log if present)." >&2
+    echo "Pass --port <N> if the serve uses a different port, or check the run is still active." >&2
     exit 1
 fi
 DIR="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("directory",""))' <<<"$SESSION_JSON")"
