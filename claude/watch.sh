@@ -82,30 +82,35 @@ echo "Tailing: $FILE" >&2
 echo "(Ctrl-C to stop)" >&2
 echo "" >&2
 
-tail -F -n +1 "$FILE" | python3 -c '
+# Capture the parser into a variable via a quoted heredoc so the Python
+# source keeps its own quoting (no bash-vs-python quote escaping).
+PARSER=$(cat <<'PY'
 import json, sys
+
 def short(s, n=200):
     s = str(s).replace("\n", " ").strip()
     return (s[:n] + "…") if len(s) > n else s
 
 for line in sys.stdin:
     line = line.strip()
-    if not line.startswith("{"): continue
-    try: ev = json.loads(line)
-    except json.JSONDecodeError: continue
+    if not line.startswith("{"):
+        continue
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        continue
     t = ev.get("type")
     if t == "assistant":
         msg = ev.get("message", {}) or {}
         for block in msg.get("content", []) or []:
             bt = block.get("type")
             if bt == "text":
-                txt = block.get("text","").strip()
+                txt = block.get("text", "").strip()
                 if txt:
                     print(f"💬 {short(txt)}", flush=True)
             elif bt == "tool_use":
-                name = block.get("name","?")
-                inp = block.get("input",{}) or {}
-                # Pick the most informative scalar field
+                name = block.get("name", "?")
+                inp = block.get("input", {}) or {}
                 detail = (
                     inp.get("command")
                     or inp.get("file_path")
@@ -121,13 +126,24 @@ for line in sys.stdin:
     elif t == "user":
         msg = ev.get("message", {}) or {}
         for block in msg.get("content", []) or []:
-            if block.get("type") != "tool_result": continue
+            if block.get("type") != "tool_result":
+                continue
             content = block.get("content", "")
             if isinstance(content, list):
-                content = " ".join(c.get("text","") for c in content if isinstance(c, dict))
+                content = " ".join(
+                    c.get("text", "") for c in content if isinstance(c, dict)
+                )
             print(f"   ↳ {short(content)}", flush=True)
     elif t == "result":
         cost = ev.get("total_cost_usd", "?")
         usage = ev.get("usage", {}) or {}
-        print(f"\n✓ result  cost=${cost}  in={usage.get(\"input_tokens\",\"?\")}  out={usage.get(\"output_tokens\",\"?\")}\n", flush=True)
-'
+        in_tok = usage.get("input_tokens", "?")
+        out_tok = usage.get("output_tokens", "?")
+        print(
+            f"\n✓ result  cost=${cost}  in={in_tok}  out={out_tok}\n",
+            flush=True,
+        )
+PY
+)
+
+tail -F -n +1 "$FILE" | python3 -c "$PARSER"
