@@ -273,7 +273,12 @@ front ends.
 │   ├── run.sh
 │   └── README.md
 │
-├── claude/                    # Claude Code strategy — PLANNED
+├── claude/                    # Claude Code strategy — IMPLEMENTED
+│   ├── agents/{surveyor,hunter,exploiter}.md
+│   ├── mcp/apisec-bridge.py   # symlink to opencode/mcp/apisec-bridge.py
+│   ├── run.sh
+│   └── README.md
+│
 └── codex/                     # Codex strategy — PLANNED
 ```
 
@@ -361,34 +366,54 @@ What each piece is doing:
   be somewhere we can throw away — read-only filesystem + tmpfs scratch
   + a fixed toolkit. The container is destroyed at the end of every run.
 
-### Claude Code and Codex strategies (planned)
+### How the Claude Code strategy works
 
-The two upcoming folders will keep the same external contract — a single
-`run.sh` that produces a `survey.json`, `findings.json`, and one
-`verdicts/<id>.json` per finding — but use each tool's native primitives:
+Same shape as opencode — three subagents in markdown files, the same MCP
+bridge proxying into the same `apisec-sandbox` container — but using
+Claude Code's native primitives:
 
-- **`claude/`** — Claude Code subagents (`.claude/agents/*.md`) for
-  surveyor / hunter / exploiter, with the same MCP `apisec-bridge`
-  re-exposed via Claude Code's MCP support. The Claude Code Agents API
-  may also be a fit for orchestration.
+- **Subagents** in `claude/agents/<name>.md`. The YAML frontmatter has
+  `name`, `description`, and a `tools` whitelist. Anything not listed is
+  unavailable to the agent — so the hunter / exploiter cannot invoke
+  native `Bash`/`Edit`/`Write`/`WebFetch`, only the MCP-provided
+  `mcp__apisec_sandbox__bash`. The body of the markdown file is the
+  agent's system prompt.
 
-- **`codex/`** — Codex's tool definitions and built-in container/sandbox
-  flags. Codex already has a `--dangerously-bypass-approvals-and-sandbox`
-  mode and tool-spec config; we wire those instead of writing a new MCP.
+- **MCP via `--mcp-config`** — `run.sh` generates a per-run `mcp.json`
+  with an absolute path to the shared `apisec-bridge.py` and passes it
+  to Claude with `--strict-mcp-config` so only the apisec-sandbox MCP
+  is loaded (no global servers leak in).
 
-In all three cases the `docker/apisec-runner/` image and `TOOLS.md`
-manifest are shared. Only the agent definitions and the orchestration
-glue change.
+- **Per-call invocation** — each phase is a separate `claude -p
+  --agent <name>` call, with `--add-dir <workspace>` so the agent's host
+  filesystem cwd matches the container's `/workspace` mount. The agents
+  are installed under `<workspace>/.claude/agents/` as per-file symlinks
+  at run start and removed at run end.
+
+- **Stream parsing** — `--output-format stream-json` produces newline-
+  delimited events (`system`, `assistant`, `user`, `result`). `run.sh`
+  reconstructs the final response by concatenating every `text` block
+  inside `assistant` events.
+
+The bridge script and the `apisec-runner` container image are reused
+verbatim — only the agent definitions and orchestration glue change.
+
+### Codex strategy (planned)
+
+Same external contract: `run.sh` produces `survey.json`, `findings.json`,
+and one `verdicts/<id>.json` per finding. Codex has a built-in sandbox
+mode and tool-spec config; we wire those instead of writing a new MCP.
 
 ## Repository layout
 
 ```text
 .
 ├── docker/
-│   ├── apisec-runner/         # NEW — sandbox image + TOOLS.md (used by opencode)
+│   ├── apisec-runner/         # sandbox image + TOOLS.md (shared by opencode + claude)
 │   └── poc-runner/            # legacy — Python PoC sandbox used by scripts/02_verify.py
 ├── opencode/                  # opencode strategy (see opencode/README.md)
-├── findings/                  # candidate JSONs, verified runs, opencode-runs/
+├── claude/                    # Claude Code strategy (see claude/README.md)
+├── findings/                  # candidate JSONs, verified runs, opencode-runs/, claude-runs/
 ├── scripts/                   # legacy Python orchestrator (Claude/Codex/opencode CLI)
 │   ├── 01_detect.py
 │   ├── 02_verify.py
