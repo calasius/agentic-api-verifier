@@ -15,6 +15,7 @@ from common import (
     ROOT,
     CommandTimeoutError,
     RunRecorder,
+    format_usage,
     timestamp,
 )
 from models import FindingSet, VerificationSet
@@ -99,8 +100,23 @@ def preflight(
         configured_flags = os.environ.get("CODEX_EXEC_FLAGS")
         if configured_flags:
             console.print(f"Codex exec flags: {configured_flags}")
+    elif llm == "opencode":
+        configured = os.environ.get("OPENCODE_COMMAND")
+        parts = shlex.split(configured) if configured else ["opencode"]
+        launcher = parts[0]
+        if not shutil.which(launcher):
+            console.print(f"[red]Missing opencode launcher:[/] {launcher} is not in PATH")
+            ok = False
+        elif configured:
+            console.print(f"Opencode command: {configured}")
+        configured_flags = os.environ.get("OPENCODE_EXEC_FLAGS")
+        if configured_flags:
+            console.print(f"Opencode exec flags: {configured_flags}")
     else:
-        console.print(f"[red]Unknown LLM provider:[/] {llm} (expected 'claude' or 'codex')")
+        console.print(
+            f"[red]Unknown LLM provider:[/] {llm}"
+            " (expected 'claude', 'codex', or 'opencode')"
+        )
         ok = False
 
     runtime_path = shutil.which(runtime)
@@ -168,6 +184,66 @@ def print_verification(verification_set: VerificationSet) -> None:
         )
 
 
+def print_cost_summary(events: list[dict]) -> dict[str, float]:
+    cost_events = [e for e in events if e.get("stage", "").endswith(".cost")]
+    if not cost_events:
+        return {}
+    table = Table(title="LLM Cost Summary")
+    table.add_column("Stage")
+    table.add_column("Model")
+    table.add_column("Cost USD", justify="right")
+    table.add_column("In", justify="right")
+    table.add_column("Out", justify="right")
+    table.add_column("Cache Read", justify="right")
+    table.add_column("Cache Create", justify="right")
+    totals = {
+        "cost_usd": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_create_tokens": 0,
+    }
+    for event in cost_events:
+        d = event.get("details", {}) or {}
+        cost = d.get("cost_usd") or 0.0
+        in_tok = d.get("input_tokens") or 0
+        out_tok = d.get("output_tokens") or 0
+        cache_r = d.get("cache_read_tokens") or 0
+        cache_c = d.get("cache_create_tokens") or 0
+        totals["cost_usd"] += float(cost)
+        totals["input_tokens"] += int(in_tok)
+        totals["output_tokens"] += int(out_tok)
+        totals["cache_read_tokens"] += int(cache_r)
+        totals["cache_create_tokens"] += int(cache_c)
+        table.add_row(
+            event["stage"],
+            str(d.get("model") or "-"),
+            f"${float(cost):.4f}" if cost else "-",
+            f"{int(in_tok):,}",
+            f"{int(out_tok):,}",
+            f"{int(cache_r):,}",
+            f"{int(cache_c):,}",
+        )
+    table.add_row(
+        "[bold]TOTAL[/bold]",
+        "",
+        f"[bold]${totals['cost_usd']:.4f}[/bold]",
+        f"[bold]{totals['input_tokens']:,}[/bold]",
+        f"[bold]{totals['output_tokens']:,}[/bold]",
+        f"[bold]{totals['cache_read_tokens']:,}[/bold]",
+        f"[bold]{totals['cache_create_tokens']:,}[/bold]",
+    )
+    console.print(table)
+    cache_total = totals["cache_read_tokens"] + totals["cache_create_tokens"]
+    if cache_total:
+        hit_ratio = totals["cache_read_tokens"] / cache_total
+        console.print(
+            f"Cache reuse: {totals['cache_read_tokens']:,} read of "
+            f"{cache_total:,} cacheable input tokens ({hit_ratio:.0%})"
+        )
+    return totals
+
+
 def print_summary(verification_set: VerificationSet) -> dict[str, int]:
     counts = {"CONFIRMED": 0, "FAILED": 0, "UNCLEAR": 0}
     table = Table(title="Final Summary")
@@ -200,13 +276,32 @@ def main(
     candidates: Path | None = None,
     no_pause: bool = False,
     model: str = "claude-sonnet-4-6",
+    detect_model: str | None = None,
+    poc_model: str | None = None,
     detect_timeout: int = 900,
     codex_timeout: int = 900,
     poc_provider: str = "codex",
     runtime: str = "podman",
     image: str = "strike-demo/poc-runner:latest",
     llm: str = "claude",
+    use_api: bool = False,
 ) -> None:
+    effective_detect_model = detect_model or model
+    effective_poc_model = poc_model or model
+
+    if llm == "opencode" and model == "claude-sonnet-4-6":
+        model = "deepseek/deepseek-v4-pro"
+        effective_detect_model = detect_model or model
+        effective_poc_model = poc_model or model
+
+    server = None
+    if use_api:
+        from api import OpencodeServer
+        console.print("[cyan]Starting opencode serve...[/]")
+        server = OpencodeServer()
+        port = server.start()
+        console.print(f"[green]openCode API server running on port {port}[/]")
+
     pause_enabled = not no_pause
     recorder = RunRecorder()
     run_record: dict[str, object] = {
@@ -222,15 +317,19 @@ def main(
         from_cache=from_cache,
         candidates=str(candidates) if candidates else None,
         model=model,
+        detect_model=effective_detect_model,
+        poc_model=effective_poc_model,
         max_findings=max_findings,
         poc_provider=poc_provider,
         llm=llm,
+        use_api=use_api,
     )
 
+    mode_desc = "openCode API streaming" if use_api else "Podman sandbox"
     console.print(
         Panel(
-            "Auto-verification demo: detect candidate API findings, run PoCs in a Podman sandbox, "
-            "and return CONFIRMED / FAILED / UNCLEAR for human triage.",
+            f"Auto-verification demo ({mode_desc}): detect candidate API findings, "
+            "verify via opencode, and return CONFIRMED / FAILED / UNCLEAR for human triage.",
             title="Strike Demo",
         )
     )
@@ -259,19 +358,37 @@ def main(
             recorder.event("candidates.load.failed", "Candidates file does not exist")
             raise typer.Exit(1)
     else:
-        log("detect", f"Starting {llm} detection with timeout={detect_timeout}s")
-        recorder.event(
-            "detect.start", f"Starting {llm} detection", timeout=detect_timeout, llm=llm
+        log(
+            "detect",
+            f"Starting {llm} detection model={effective_detect_model} timeout={detect_timeout}s",
         )
+        recorder.event(
+            "detect.start",
+            f"Starting {llm} detection",
+            timeout=detect_timeout,
+            llm=llm,
+            model=effective_detect_model,
+        )
+
+        def on_detect_event(stage: str, message: str, details: dict) -> None:
+            if stage.endswith(".cost"):
+                log(stage, f"{message} | {format_usage(details)}")
+            else:
+                log(stage, message)
+            recorder.event(stage, message, **details)
+
         detect = load_function("01_detect.py", "detect")
         try:
             candidates_path = detect(
                 service=service,
                 max_findings=max_findings,
-                model=model,
+                model=effective_detect_model,
                 from_cache=from_cache,
                 timeout=detect_timeout,
                 llm=llm,
+                use_api=use_api,
+                server=server,
+                on_event=on_detect_event,
             )
         except CommandTimeoutError as exc:
             console.print(f"[red]{exc}[/]")
@@ -296,7 +413,12 @@ def main(
     recorder.event("verify.start", "Starting verification", max_findings=max_findings)
 
     def on_verify_event(stage: str, message: str, details: dict) -> None:
-        log(stage, message)
+        if stage == "verify.text":
+            console.print(message, end="")
+        elif stage.endswith(".cost"):
+            log(stage, f"{message} | {format_usage(details)}")
+        else:
+            log(stage, message)
         recorder.event(stage, message, **details)
 
     try:
@@ -305,12 +427,14 @@ def main(
             target_url=target_url,
             max_findings=max_findings,
             from_cache=from_cache,
-            model=model,
+            model=effective_poc_model,
             codex_timeout=codex_timeout,
             poc_provider=poc_provider,
             image=image,
             runtime=runtime,
             llm=llm,
+            use_api=use_api,
+            server=server,
             on_event=on_verify_event,
             on_partial=recorder.partial,
         )
@@ -325,16 +449,27 @@ def main(
     pause(pause_enabled)
 
     metrics = print_summary(verification_set)
+    cost_totals = print_cost_summary(recorder.data.get("events", []))
     run_record["verified_path"] = str(verified_path)
     run_record["metrics"] = metrics
     run_record["findings"] = json.loads(verification_set.model_dump_json())["findings"]
-    recorder.update(verified_path=str(verified_path), metrics=metrics, status="completed")
+    run_record["cost_totals"] = cost_totals
+    recorder.update(
+        verified_path=str(verified_path),
+        metrics=metrics,
+        status="completed",
+        cost_totals=cost_totals,
+    )
 
     output = FINDINGS_DIR / f"demo-run-{timestamp()}.json"
     output.write_text(json.dumps(run_record, indent=2) + "\n")
     recorder.update(demo_run_path=str(output))
     console.print(f"Run record: {output}")
     console.print(f"Partial run log: {recorder.path}")
+
+    if server:
+        server.stop()
+        console.print("[dim]openCode API server stopped[/]")
 
 
 if __name__ == "__main__":
