@@ -1,64 +1,78 @@
-# Strike Demo
+# Coding Agents for Vulnerability Discovery and Exploitation
 
-Vulnerability auto-verification demo for OWASP crAPI.
+Proof of concept for using coding agents (Claude Code, OpenAI Codex, opencode +
+DeepSeek-V4-Pro) to automatically detect candidate API vulnerabilities,
+generate executable proof-of-concept exploits, run them against a live target,
+and return a structured verdict.
 
-The demo shows a 5-10 minute flow where an LLM agent (Claude by default,
-Codex optional) detects candidate API vulnerabilities, generates an executable
-proof of concept for each finding, runs that PoC in an isolated Podman
-sandbox, and returns a structured verdict:
+This is a research PoC, not a production scanner. The goal is to show what's
+realistic today when you let an agent both reason about source and execute
+HTTP requests end-to-end.
 
-- `CONFIRMED`: executable evidence supports the hypothesis.
-- `FAILED`: the PoC ran and did not support the hypothesis.
-- `UNCLEAR`: the system could not prove the finding and should escalate it to a
-  human reviewer.
+## What it does
 
-The intended message is narrow: this does not replace human security reviewers.
-It removes mechanical verification work when a finding can be safely reproduced.
+Given a target source tree and a running instance of the application, the PoC
+runs three stages:
 
-## LLM Provider
+1. **Detect** — the agent reads the source, identifies candidate vulnerabilities
+   (OWASP API Top 10 by default), and emits operational findings: file/line,
+   hypothesis, attack request, setup steps, expected response signal.
+2. **Verify** — for each finding, the agent generates and runs an exploit
+   against the live target. Two execution paths are supported:
+   - PoC-in-sandbox: the agent emits Python code, the demo runs it inside an
+     isolated Podman container with a fixed `TARGET_URL`.
+   - Direct execution: the agent itself drives `curl`/HTTP via its `Bash` tool
+     against the target (no sandbox, no Python layer).
+3. **Verdict** — each finding ends as `CONFIRMED`, `FAILED`, or `UNCLEAR` with
+   captured HTTP evidence (requests, responses, status codes).
 
-Selectable via `--llm {claude,codex}` (default: `claude`).
+`UNCLEAR` matters: a real triage tool needs to admit when it can't prove
+something instead of guessing.
 
-- `claude` — Claude Code CLI (`claude` on PATH). Recommended. Runs on the host.
-  Recommended models: `claude-opus-4-7` for detection (deeper reasoning over
-  source) and `claude-sonnet-4-6` for PoC generation (faster). The demo wires
-  an authorization frame via `--append-system-prompt` so the agent treats the
-  run as an authorized test against an intentionally vulnerable training app.
-- `codex` — OpenAI Codex CLI. Kept for compatibility. Configurable through
-  `CODEX_COMMAND` and `CODEX_EXEC_FLAGS` (useful when Codex/Node.js live in a
-  Toolbox container while Podman runs on the base system).
+## Supported coding agents
+
+Selectable via `--llm {claude,codex,opencode}`.
+
+- **Claude Code** (`claude` CLI) — default. Recommended models:
+  `claude-opus-4-7` for detection, `claude-sonnet-4-6` for PoC generation.
+- **OpenAI Codex** (`codex` CLI) — works with GPT-class models.
+- **opencode** — runs DeepSeek-V4-Pro (and other providers) through the
+  Vercel AI SDK. Two execution modes:
+  - CLI per call: `opencode run` invoked once per detect/verify.
+  - Persistent server (`--use-api`): one `opencode serve` shared across calls
+    via `opencode run --attach`. Faster when there are many findings.
+
+DeepSeek-V4-Pro is interesting because it's cheap (~$0.01 per finding verified
+end-to-end) and supports tool calling reliably through opencode, so it can
+drive `Bash`/`Read`/`Grep`/`Glob` directly during verification.
 
 Custom invocations are supported via env vars: `CLAUDE_COMMAND`,
-`CLAUDE_EXEC_FLAGS`, `CODEX_COMMAND`, `CODEX_EXEC_FLAGS`.
+`CLAUDE_EXEC_FLAGS`, `CODEX_COMMAND`, `CODEX_EXEC_FLAGS`, `OPENCODE_COMMAND`,
+`OPENCODE_EXEC_FLAGS`.
 
-## Target Application: OWASP crAPI
+## Example target: OWASP crAPI
 
-The application under test is OWASP crAPI, the "completely ridiculous API".
-It is an intentionally vulnerable B2C car-service platform built for API
-security training. A user can create an account, log in, register vehicles,
-request mechanic services, buy car accessories, and interact with a community
-blog/comments area.
+The default target wired into the prompts is OWASP crAPI ("completely
+ridiculous API"), an intentionally vulnerable Java/Spring Boot training app
+with deliberate OWASP API Top 10 issues. Any other intentionally-vulnerable
+app with a similar source layout (WebGoat, VAmPI, Juice Shop, DVWS) can be
+swapped in by editing the prompts in `01_detect.py` and `02_verify.py`.
 
-For this demo, crAPI is useful because it looks like a realistic API-backed
-product while deliberately exposing OWASP API Top 10 weaknesses. The demo agent
-does not need to attack a real third-party system: it can analyze and verify
-findings against this authorized local target.
-
-### crAPI Architecture
+### crAPI architecture
 
 ```mermaid
 flowchart TB
     user["Browser / API Client"]
-    demo["strike-demo<br/>LLM agent + verifier"]
-    sandbox["Podman PoC sandbox<br/>strike-demo/poc-runner"]
+    agent["Coding agent<br/>(detect + verify)"]
+    sandbox["Podman PoC sandbox<br/>(optional)"]
 
     subgraph host["Local host"]
         user
-        demo
+        agent
         sandbox
     end
 
-    subgraph crapi["OWASP crAPI running with Podman Compose"]
+    subgraph crapi["OWASP crAPI (Podman Compose)"]
         web["crapi-web<br/>OpenResty / Web UI<br/>localhost:8888"]
         identity["crapi-identity<br/>Java<br/>users, auth, JWT, OTP, vehicles"]
         workshop["crapi-workshop<br/>Python<br/>mechanics, services, orders"]
@@ -72,8 +86,9 @@ flowchart TB
     end
 
     user -->|"HTTP UI/API"| web
-    demo -->|"source analysis"| identity
-    demo -->|"generates PoC"| sandbox
+    agent -->|"source analysis"| identity
+    agent -->|"generates PoC"| sandbox
+    agent -->|"direct HTTP (verify mode)"| web
     sandbox -->|"HTTP evidence"| web
 
     web --> identity
@@ -101,316 +116,227 @@ flowchart TB
     chatbot --> chroma
 
     classDef external fill:#eef2ff,stroke:#4f46e5,color:#111827,stroke-width:2px;
-    classDef demoNode fill:#ecfeff,stroke:#0891b2,color:#0f172a,stroke-width:2px;
+    classDef agentNode fill:#ecfeff,stroke:#0891b2,color:#0f172a,stroke-width:2px;
     classDef edge fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:2px;
     classDef service fill:#f0fdf4,stroke:#16a34a,color:#052e16,stroke-width:2px;
     classDef data fill:#fff7ed,stroke:#ea580c,color:#431407,stroke-width:2px;
     classDef infra fill:#fdf2f8,stroke:#db2777,color:#500724,stroke-width:2px;
 
     class user external;
-    class demo,sandbox demoNode;
+    class agent,sandbox agentNode;
     class web edge;
     class identity,workshop,community,chatbot service;
     class postgres,mongo,chroma data;
     class mailhog,gateway infra;
 ```
 
-In the live demo, the bounded scope is `services/identity`. That keeps the run
-short and focuses the agent on authentication, authorization, JWT/OTP, account,
-and vehicle-management code paths.
+The bounded scope by default is `services/identity` — authentication,
+authorization, JWT/OTP, account, and vehicle code paths. That keeps the run
+under 5–10 minutes.
 
-## Repository Layout
+## Sample run: 5/5 confirmed against crAPI identity
+
+Latest end-to-end run on `services/identity` returned 5 CONFIRMED findings,
+0 FAILED, 0 UNCLEAR, with HTTP evidence captured per finding. Total cost
+across detect + 5 verify rounds: ~$0.066 (273k input / 7k output / 265k
+cache-read tokens — heavy prompt caching against the same source pack).
+
+| ID    | OWASP    | Class                                 | File:line                                              | Verdict   |
+|-------|----------|---------------------------------------|--------------------------------------------------------|-----------|
+| f-001 | API1:2023 | BOLA — vehicle location PII leak      | `controller/VehicleController.java:122`                | CONFIRMED |
+| f-002 | API2:2023 | `alg:none` accepted (PlainJWT fallback) | `config/JwtProvider.java:199`                        | CONFIRMED |
+| f-003 | API2:2023 | RS256→HS256 algorithm confusion       | `config/JwtProvider.java:179`                          | CONFIRMED |
+| f-004 | API2:2023 | JKU header → SSRF + key injection     | `config/JwtProvider.java:134`                          | CONFIRMED |
+| f-005 | API2:2023 | Unauthenticated PII leak via dashboard | `service/Impl/UserServiceImpl.java:214`               | CONFIRMED |
+
+### f-001 — BOLA on vehicle location
+
+`GET /identity/api/v2/vehicle/{carId}/location` is wired to a method literally
+named `getLocationBOLA`. `VehicleServiceImpl.getVehicleLocation` looks up the
+vehicle by UUID and returns owner `fullName`, `email`, and GPS coordinates
+without comparing the requesting user's identity to `vehicle.getOwner()`.
+
+A freshly signed-up attacker's JWT successfully retrieved Adam's full PII +
+GPS coordinates by querying his vehicle UUID:
+
+```
+HTTP 200
+{
+  "carId": "f89b5f21-7829-45cb-a650-299a61090378",
+  "fullName": "Adam",
+  "email": "adam007@example.com",
+  "vehicleLocation": { "latitude": "32.778889", "longitude": "-91.919243" }
+}
+```
+
+### f-002 — `alg:none` JWT acceptance
+
+`JwtProvider.validateJwtToken` parses the token via `SignedJWT.parse`. When
+that throws `ParseException`, the catch block falls back to
+`PlainJWT.parse(authToken)` and returns `true` — accepting unsigned tokens as
+valid.
+
+Two forged unsigned tokens (`{"alg":"none"}` for `admin@example.com` and
+`adam007@example.com`) were sent to `/identity/api/v2/user/dashboard` and
+`/identity/api/v2/vehicle/vehicles`. Both returned HTTP 200 with full PII
+matching the forged `sub` claim.
+
+### f-003 — RS256 → HS256 algorithm confusion
+
+When the JWT header advertises `alg=HS256`, `getJwtSecret()`
+base64-encodes the RSA public key bytes and uses that string as the HMAC
+secret for `MACVerifier`. The JWKS endpoint (`/identity/api/v2/jwks.json`) is
+exposed unauthenticated, so the public key is trivially fetchable.
+
+Forging a token with `alg=HS256` and signing it with the base64-encoded
+public key as HMAC secret bypasses signature verification:
+
+```
+HTTP 200 GET /identity/api/v2/user/dashboard
+{ "id": ..., "name": "Admin", "email": "admin@example.com",
+  "role": "ROLE_ADMIN", "available_credit": 100.0 }
+```
+
+### f-004 — JKU header → SSRF + arbitrary key injection
+
+For non-`HS256` tokens, `getKeyFromJkuHeader` extracts the `jku` (JWK Set URL)
+claim from the JWT header, makes an unfettered HTTP request to that URL, and
+loads the returned JWKS as a trusted key set. Any RSA public key the
+attacker serves is accepted for signature verification.
+
+Standing up a tiny HTTP server with the attacker's RSA public key:
+
+```
+http://host.containers.internal:9999/jwks.json
+```
+
+A forged RS256 token with `jku` pointing at that URL and signed with the
+attacker's matching private key was accepted. Bonus: the `jku` fetch is a
+classic SSRF primitive (the server will fetch any URL).
+
+### f-005 — Unauthenticated PII leak via dashboard
+
+`GET /identity/api/v2/user/dashboard` is `permitAll()` in `WebSecurityConfig`,
+and the controller calls `getUserByRequestToken` which internally invokes
+`getUserFromTokenWithoutValidation` — JWT signature is never checked. Any
+unsigned JWT carrying a `sub` claim returns the corresponding user's full
+profile.
+
+```
+GET /identity/api/v2/user/dashboard
+Authorization: Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSJ9.
+
+HTTP 200
+{ "id": 5, "name": "Admin", "email": "admin@example.com",
+  "number": "9010203040", "role": "ROLE_ADMIN",
+  "available_credit": 100.0 }
+```
+
+Full per-finding evidence (request log, response excerpts, source
+references) is in `findings/verified-latest.json`.
+
+## Repository layout
 
 ```text
-strike-demo/
-├── AGENTS.md
-├── PLAN.md
-├── README.md
+.
 ├── docker/
-│   └── poc-runner/
-│       └── Dockerfile
-├── findings/
-│   ├── cache/
-│   │   └── identity-candidates.json
-│   └── *.json
+│   └── poc-runner/        # Podman image for sandboxed PoC execution
+├── findings/              # candidate JSONs + verified runs + run records
 ├── scripts/
-│   ├── 01_detect.py
-│   ├── 02_verify.py
-│   ├── 03_demo.py
-│   ├── common.py
-│   ├── models.py
-│   └── sandbox_mcp.py
+│   ├── 01_detect.py       # source-aware candidate finding generation
+│   ├── 02_verify.py       # PoC generation + sandbox or direct execution
+│   ├── 03_demo.py         # end-to-end orchestration
+│   ├── api.py             # opencode HTTP server lifecycle + run-attach helpers
+│   ├── common.py          # LLM invocation, JSON parsing, run recorder
+│   ├── models.py          # Pydantic schemas for findings/verifications
+│   └── sandbox_mcp.py     # Podman PoC runner
 ├── pyproject.toml
 └── uv.lock
 ```
 
 ## Requirements
 
-- Python 3.12
-- `uv`
-- Either:
-  - Claude Code CLI (`claude`) authenticated and on PATH (default), or
-  - OpenAI Codex CLI plus Node.js
-- Podman
-- `podman compose` or `podman-compose`
+- Python 3.12, `uv`
+- One coding agent CLI on `PATH`:
+  - `claude` (Claude Code), or
+  - `codex` (OpenAI Codex) + Node.js, or
+  - `opencode`
+- Podman + `podman compose` or `podman-compose` (only required for the
+  sandbox PoC path)
 
-This project is configured for Podman by default. The scripts accept
-`--runtime podman` explicitly when needed.
+If a CLI lives in a Toolbox container while Podman runs on the base system,
+override the launcher with `CLAUDE_COMMAND` / `CODEX_COMMAND` /
+`OPENCODE_COMMAND`.
 
-If you need to run the LLM CLI in a different environment than the host (e.g.
-Codex inside a Fedora Toolbox container while Podman runs on the base system),
-override the launcher via `CLAUDE_COMMAND` or `CODEX_COMMAND`:
-
-```bash
-CODEX_COMMAND="toolbox run --container dev codex" UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/03_demo.py \
-  --service identity \
-  --max-findings 3 \
-  --target-url http://localhost:8888 \
-  --llm codex \
-  --model gpt-5.5 \
-  --detect-timeout 1800 \
-  --codex-timeout 1800 \
-  --runtime podman
-```
-
-## Install Dependencies
+## Install
 
 ```bash
 uv sync
 ```
 
-If your environment has a read-only global uv cache, use a writable cache:
+If your environment has a read-only global uv cache:
 
 ```bash
 UV_CACHE_DIR=/tmp/uv-cache uv sync
 ```
 
-## Rehearsal Mode
+## Cache mode (no LLM, no target)
 
-Use rehearsal mode when you want a deterministic demo without depending on
-the LLM, crAPI, network state, or the Podman runner.
+Deterministic walk-through of the flow without the LLM, crAPI, network, or
+Podman:
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/03_demo.py --from-cache --no-pause
+uv run python scripts/03_demo.py --from-cache --no-pause
 ```
 
-Expected result:
+Expected:
 
 ```text
 Metrics: 2 confirmed, 1 unclear, 0 failed.
 ```
 
-For a live presentation, omit `--no-pause` so the script pauses between steps:
+Drop `--no-pause` to step through each stage.
 
-```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/03_demo.py --from-cache
-```
+## Live setup
 
-## Live Setup With crAPI
-
-Clone crAPI into the repository root:
+Clone the target into the repo root:
 
 ```bash
 git clone https://github.com/OWASP/crAPI.git
 ```
 
-Start crAPI with Podman Compose:
+Start it:
 
 ```bash
 cd crAPI/deploy/docker
 podman compose -f docker-compose.yml up -d
 ```
 
-If your environment uses the standalone compose wrapper:
-
-```bash
-cd crAPI/deploy/docker
-podman-compose -f docker-compose.yml up -d
-```
-
-Verify the target is reachable:
+Verify:
 
 ```bash
 curl -i http://localhost:8888
 ```
 
-The scripts use `http://localhost:8888` by default. Override it with
-`--target-url` if needed.
+(Override the URL with `--target-url` when running against a different
+deployment.)
 
-## Build the PoC Runner
+## Build the PoC sandbox image (optional)
 
-From the repository root:
+Only needed for the sandbox PoC path. Skip for the direct-execution path
+used by `--use-api`.
 
 ```bash
 podman build -t strike-demo/poc-runner:latest docker/poc-runner
 ```
 
-The runner image contains Python, `httpx`, `requests`, `curl`, and `jq`. PoCs are
-mounted read-only into the container and executed with:
+The image contains Python, `httpx`, `requests`, `curl`, `jq`. PoCs run with
+read-only filesystem, memory/PID limits, and `TARGET_URL` injected as env.
 
-- read-only filesystem,
-- memory limit,
-- PID limit,
-- automatic cleanup,
-- target URL passed through `TARGET_URL`.
-
-## Live Detection
-
-Run the detector against `services/identity`:
+## End-to-end with Claude
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/01_detect.py \
-  --service identity \
-  --llm claude \
-  --model claude-opus-4-7
-```
-
-This writes:
-
-- `findings/candidates-<timestamp>.json`
-- `findings/candidates-latest.json`
-
-Under the hood, with `--llm claude` the detector calls:
-
-```bash
-claude -p --append-system-prompt "<authorization frame>" --model <model> \
-  --output-format json "<detection prompt>"
-```
-
-(working directory is set to `./crAPI`). With `--llm codex` it falls back to
-`codex exec --model <model> --json --cd ./crAPI "<detection prompt>"`.
-
-Before calling the LLM, the detector performs a local focused preselection of
-the most relevant Java files: controllers, JWT/security config, user services,
-vehicle services, and related repositories/models. The prompt includes numbered
-source excerpts so the agent can produce concrete file/line findings without
-exploring the full service tree first.
-
-Each finding emitted is **operational**, not just descriptive. In addition to
-the bug class, file, and line, every finding carries:
-
-- `victim_identity` — who the exploit targets / impersonates.
-- `attack_request` — method, path, headers, body, and notes for the request.
-- `expected_response_signal` — the concrete substring/field that proves the
-  bug fired.
-- `setup_state` — steps the PoC runs before the attack (signup, login, etc).
-- `target_state_required` — preexisting target state the PoC cannot create
-  itself (seed users, fixed UUIDs); `null` means the PoC is self-sufficient.
-
-These fields are authoritative for the PoC generator, which is instructed to
-build the exploit directly from them rather than improvise endpoints.
-
-The expected output schema is validated with Pydantic before it is written.
-
-## Live Verification
-
-Verify the latest candidates. In live mode, this step calls the LLM again to
-generate a finding-specific Python PoC, then executes that PoC through the
-Podman sandbox:
-
-```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/02_verify.py \
-  --input findings/candidates-latest.json \
-  --target-url http://localhost:8888 \
-  --llm claude \
-  --model claude-opus-4-7 \
-  --runtime podman
-```
-
-This writes:
-
-- `findings/verified-<timestamp>.json`
-- `findings/verified-latest.json`
-
-If the LLM refuses, errors, or times out on a single finding, that finding is
-recorded as `UNCLEAR` with the error as evidence and the loop continues with
-the next finding instead of aborting the whole run.
-
-## Seeded Candidate Flow
-
-For the most reliable live demo, assume a scanner or security tool already
-produced candidate findings. This skips open-ended discovery and demonstrates
-the agentic part that matters most: PoC generation, sandbox execution, and
-evidence reporting.
-
-Seeded crAPI identity candidates live at:
-
-```text
-findings/candidates/identity-known.json
-```
-
-Run the seeded candidate flow:
-
-```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/03_demo.py \
-  --candidates findings/candidates/identity-known.json \
-  --max-findings 1 \
-  --target-url http://localhost:8888 \
-  --llm claude \
-  --model claude-sonnet-4-6 \
-  --runtime podman \
-  --codex-timeout 900 \
-  --no-pause
-```
-
-This still uses the LLM to generate the PoC and still executes the PoC inside
-the Podman sandbox. It only skips the slow discovery step.
-
-If the LLM CLI is too slow or gets stuck, run the same seeded flow with a
-deterministic template PoC for known crAPI findings:
-
-```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/03_demo.py \
-  --candidates findings/candidates/identity-known.json \
-  --max-findings 1 \
-  --target-url http://localhost:8888 \
-  --runtime podman \
-  --poc-provider template \
-  --no-pause
-```
-
-This path still executes the PoC inside the Podman sandbox and still produces
-the same evidence/report artifacts. It only replaces LLM PoC generation with a
-predefined PoC template for known candidates.
-
-If Codex gets stuck waiting on sandbox/approval behavior during local demo
-work, pass explicit `codex exec` flags with `CODEX_EXEC_FLAGS`. For example:
-
-```bash
-CODEX_COMMAND="toolbox run --container dev codex" \
-CODEX_EXEC_FLAGS="--dangerously-bypass-approvals-and-sandbox" \
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/03_demo.py \
-  --candidates findings/candidates/identity-known.json \
-  --max-findings 1 \
-  --target-url http://localhost:8888 \
-  --llm codex \
-  --model gpt-5.5 \
-  --runtime podman \
-  --codex-timeout 900 \
-  --no-pause
-```
-
-Use that bypass only for this local, intentionally vulnerable crAPI environment.
-
-During a run, progress is printed to the terminal and partial state is
-continuously written to:
-
-```text
-findings/runs/run-<timestamp>.json
-```
-
-In another terminal, follow partial results with:
-
-```bash
-tail -f findings/runs/run-*.json
-```
-
-## End-to-End Live Demo
-
-Run the full flow:
-
-```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/03_demo.py \
+uv run python scripts/03_demo.py \
   --service identity \
   --max-findings 3 \
   --target-url http://localhost:8888 \
@@ -418,135 +344,171 @@ UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/03_demo.py \
   --model claude-opus-4-7 \
   --detect-timeout 1800 \
   --codex-timeout 1800 \
-  --runtime podman
-```
-
-Use `--no-pause` for automated rehearsals:
-
-```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/03_demo.py \
-  --service identity \
-  --max-findings 3 \
-  --target-url http://localhost:8888 \
-  --llm claude \
   --runtime podman \
   --no-pause
 ```
 
-Every run writes a reproducible record:
+## End-to-end with DeepSeek via opencode
 
-```text
-findings/demo-run-<timestamp>.json
-```
-
-## Useful Commands
-
-Run lint:
+DeepSeek-V4-Pro through opencode, using the persistent-server path so the
+agent can `curl` directly against the target without a Python sandbox in the
+middle:
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .
+uv run python scripts/03_demo.py \
+  --llm opencode --use-api \
+  --model deepseek/deepseek-v4-pro \
+  --candidates findings/candidates-f002-f003.json \
+  --no-pause
 ```
 
-Format files:
+The opencode provider config (in `~/.config/opencode/opencode.json`) needs
+the DeepSeek provider and the auto-allow permission rules for `bash`,
+`external_directory`, `webfetch` so the agent can drive curl without prompts.
 
-```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run ruff format .
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "bash": "allow",
+    "external_directory": "allow",
+    "webfetch": "allow"
+  },
+  "provider": {
+    "deepseek": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "DeepSeek",
+      "options": {
+        "baseURL": "https://api.deepseek.com",
+        "apiKey": "..."
+      },
+      "models": {
+        "deepseek-v4-pro": {
+          "name": "DeepSeek-V4-Pro",
+          "limit": { "context": 1048576, "output": 262144 }
+        }
+      }
+    }
+  }
+}
 ```
 
-Run the sandbox directly against a PoC file:
+## End-to-end with Codex
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/sandbox_mcp.py run poc.py \
+uv run python scripts/03_demo.py \
+  --service identity \
+  --max-findings 3 \
+  --target-url http://localhost:8888 \
+  --llm codex \
+  --model gpt-5.5 \
+  --detect-timeout 1800 \
+  --codex-timeout 1800 \
+  --runtime podman \
+  --no-pause
+```
+
+## Seeded candidates (skip detect)
+
+Useful when iterating on the verify path or running a reliable timed walk-through.
+
+```bash
+uv run python scripts/03_demo.py \
+  --candidates findings/candidates-f002-f003.json \
+  --max-findings 2 \
+  --target-url http://localhost:8888 \
+  --llm opencode --use-api \
+  --model deepseek/deepseek-v4-pro \
+  --no-pause
+```
+
+## Outputs
+
+Every run produces:
+
+- `findings/candidates-<timestamp>.json` — detect output
+- `findings/verified-<timestamp>.json` — per-finding verdicts + evidence
+- `findings/demo-run-<timestamp>.json` — full reproducible run record
+- `findings/runs/run-<timestamp>.json` — partial state, written continuously
+  during the run; `tail -f` it from another terminal to follow progress
+
+## Operational fields on every finding
+
+The detect step does not just emit "there's a BOLA in foo.java". Each finding
+carries:
+
+- `victim_identity` — who the exploit targets / impersonates.
+- `attack_request` — method, path, headers, body, notes.
+- `expected_response_signal` — concrete substring/field that proves the bug
+  fired.
+- `setup_state` — steps the PoC runs before the attack (signup, login).
+- `target_state_required` — preexisting target state the PoC cannot create
+  itself (seed users, fixed UUIDs); `null` means self-sufficient.
+
+These are authoritative for the verifier — it builds the exploit directly
+from them rather than improvise.
+
+## Useful commands
+
+```bash
+uv run ruff check .
+uv run ruff format .
+```
+
+Run the sandbox directly against an existing PoC:
+
+```bash
+uv run python scripts/sandbox_mcp.py run poc.py \
   --target-url http://localhost:8888 \
   --runtime podman
 ```
 
 ## Troubleshooting
 
-### `podman` is not found
-
-Install Podman or make sure it is available in `PATH`:
+### `podman` not found / `podman compose` not available
 
 ```bash
 command -v podman
-```
-
-### `podman compose` is not available
-
-Use `podman-compose` if it is installed:
-
-```bash
-podman-compose -f docker-compose.yml up -d
+podman-compose -f docker-compose.yml up -d   # fallback
 ```
 
 ### crAPI is unreachable
 
-Check containers:
-
 ```bash
 podman ps
-```
-
-Then verify the HTTP endpoint:
-
-```bash
 curl -i http://localhost:8888
 ```
 
 ### LLM is slow or unavailable
 
-Use cache mode for the presentation:
+Cache mode:
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/03_demo.py --from-cache
+uv run python scripts/03_demo.py --from-cache
 ```
 
 ### Claude refuses a specific finding
 
-Claude's safety classifiers occasionally refuse PoC generation. The verifier
-catches refusals, marks the finding as `UNCLEAR` with the error in evidence,
-and continues with the next finding. If a specific finding refuses
-consistently, rephrase its hypothesis (e.g. avoid "any user including admin"
-language) or fall back to `--llm codex` for that run.
+The verifier catches refusals, marks the finding as `UNCLEAR` with the error
+in evidence, and continues. For consistent refusals, rephrase the hypothesis
+(avoid "any user including admin" language) or fall back to `--llm codex` /
+`--llm opencode`.
 
-### Podman is on the base system but Codex/Node.js are in Toolbox
+### opencode + DeepSeek silently does not run tools
 
-Use `CODEX_COMMAND` so only Codex runs inside Toolbox while the sandbox still
-uses base-system Podman:
+If you see lots of streamed text but no tool calls, two common causes:
 
-```bash
-CODEX_COMMAND="toolbox run --container dev codex" UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/03_demo.py \
-  --service identity \
-  --max-findings 3 \
-  --target-url http://localhost:8888 \
-  --llm codex \
-  --model gpt-5.5 \
-  --detect-timeout 1800 \
-  --codex-timeout 1800 \
-  --runtime podman
-```
+1. The DeepSeek model is configured as a reasoning model in opencode config
+   (`reasoning: true`, `thinking: { type: "enabled" }`) — reasoning variants
+   may not emit tool calls. Try `deepseek-v4-flash` or remove the reasoning
+   flags.
+2. Permission gates are blocking `bash` / `external_directory`. Add the
+   `permission` block shown above to your opencode config.
 
-### uv cannot write to its cache
-
-Use a writable cache directory:
+### Codex stuck on approval prompts
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv sync
+CODEX_EXEC_FLAGS="--dangerously-bypass-approvals-and-sandbox" uv run python ...
 ```
 
-## Demo Narrative
-
-1. Show the problem: human reviewers spend time validating executable findings.
-2. Run candidate detection over one bounded service: `services/identity`.
-3. Show the candidate table with source references, hypotheses, and the
-   operational fields (`attack_request`, `setup_state`, `expected_response_signal`).
-4. Show the LLM generating a PoC for each finding.
-5. Run each generated PoC inside the Podman sandbox.
-6. Emphasize the important distinction between `CONFIRMED` and `UNCLEAR`.
-7. Close with metrics and the question of where this could reduce manual load.
-
-Suggested questions for the CTO:
-
-1. What percentage of current findings are mechanically verifiable?
-2. Where do general-purpose models fall short in your production workflow?
-3. Which part of reviewer work would be most valuable to automate first?
+Use only against authorized, intentionally-vulnerable local targets.
