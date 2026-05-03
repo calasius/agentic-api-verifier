@@ -102,6 +102,24 @@ verdicts/<id>.json    # one per finding from exploiter
 mcp.json              # the per-run MCP config used
 ```
 
+## Watching progress live
+
+In a second terminal, while `run.sh` is going:
+
+```bash
+claude/watch.sh                  # auto-detect the active phase (latest .jsonl)
+claude/watch.sh surveyor         # watch only the surveyor phase
+claude/watch.sh hunter           # watch only the hunter phase
+claude/watch.sh exploiter        # watch the exploiter loop
+claude/watch.sh --run 20260503-072300   # specific past run
+```
+
+The watcher pretty-prints the stream-json events:
+- `💬` text chunk from the assistant
+- `⚙ <tool> :: <input>` tool call (Read/Grep/Bash/MCP/...)
+- `   ↳ <output>` tool result excerpt
+- `✓ result  cost=$… in=… out=…` final result event when the phase ends
+
 ## Customizing the toolkit
 
 Add or remove tools by editing `docker/apisec-runner/Dockerfile` and
