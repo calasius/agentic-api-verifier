@@ -130,126 +130,273 @@ flowchart TB
     class mailhog,gateway infra;
 ```
 
-The bounded scope by default is `services/identity` — authentication,
-authorization, JWT/OTP, account, and vehicle code paths. That keeps the run
-under 5–10 minutes.
+For a fast walk-through, scope can be bounded to a single service like
+`services/identity` (authentication, authorization, JWT/OTP, account,
+vehicle code paths). The opencode strategy below scans the entire repo by
+default — see the sample run for a full-tree result that covers all four
+services.
 
-## Sample run: 5/5 confirmed against crAPI identity
+## Sample run: 10/10 confirmed across all crAPI services
 
-Latest end-to-end run on `services/identity` returned 5 CONFIRMED findings,
-0 FAILED, 0 UNCLEAR, with HTTP evidence captured per finding. Total cost
-across detect + 5 verify rounds: ~$0.066 (273k input / 7k output / 265k
-cache-read tokens — heavy prompt caching against the same source pack).
+Latest end-to-end run with the opencode strategy (DeepSeek-V4-Pro, three
+agents — surveyor, hunter, exploiter — with all execution routed through
+the `apisec-sandbox` container) returned **10 CONFIRMED, 0 FAILED, 0
+UNCLEAR**, with HTTP evidence captured per finding. The hunter explored all
+four crAPI services in three different languages — `services/identity`
+(Java/Spring), `services/workshop` (Python/Django), `services/community`
+(Go) — and produced findings spanning **6 OWASP API Top 10 categories**.
 
-| ID    | OWASP    | Class                                 | File:line                                              | Verdict   |
-|-------|----------|---------------------------------------|--------------------------------------------------------|-----------|
-| f-001 | API1:2023 | BOLA — vehicle location PII leak      | `controller/VehicleController.java:122`                | CONFIRMED |
-| f-002 | API2:2023 | `alg:none` accepted (PlainJWT fallback) | `config/JwtProvider.java:199`                        | CONFIRMED |
-| f-003 | API2:2023 | RS256→HS256 algorithm confusion       | `config/JwtProvider.java:179`                          | CONFIRMED |
-| f-004 | API2:2023 | JKU header → SSRF + key injection     | `config/JwtProvider.java:134`                          | CONFIRMED |
-| f-005 | API2:2023 | Unauthenticated PII leak via dashboard | `service/Impl/UserServiceImpl.java:214`               | CONFIRMED |
+| ID    | OWASP     | Class                            | File:line                                                 |
+|-------|-----------|----------------------------------|-----------------------------------------------------------|
+| f-001 | API2:2023 | `alg:none` JWT (PlainJWT fallback) | `services/identity/.../config/JwtProvider.java:197`       |
+| f-002 | API2:2023 | RS256↔HS256 algorithm confusion   | `services/identity/.../config/JwtProvider.java:179`       |
+| f-003 | API2:2023 | JKU header → SSRF + key injection | `services/identity/.../config/JwtProvider.java:130`       |
+| f-004 | API1:2023 | BOLA — vehicle location           | `services/identity/.../controller/VehicleController.java:121` |
+| f-005 | API5:2023 | BFLA — admin video delete         | `services/identity/.../controller/ProfileController.java:129` |
+| f-006 | API7:2023 | SSRF + token exfiltration         | `services/workshop/crapi/merchant/views.py:87`            |
+| f-007 | API8:2023 | SQL injection in apply_coupon     | `services/workshop/crapi/shop/views.py:388`               |
+| f-008 | API8:2023 | NoSQL injection (`$regex`)        | `services/community/api/controllers/coupon_controller.go:74` |
+| f-009 | API8:2023 | Path traversal (double-encoding)  | `services/workshop/crapi/mechanic/views.py:395`           |
+| f-010 | API2:2023 | Cross-service `alg:none` trust    | `services/workshop/utils/jwt.py:61`                       |
 
-### f-001 — BOLA on vehicle location
+### f-001 — `alg:none` JWT acceptance
 
-`GET /identity/api/v2/vehicle/{carId}/location` is wired to a method literally
-named `getLocationBOLA`. `VehicleServiceImpl.getVehicleLocation` looks up the
-vehicle by UUID and returns owner `fullName`, `email`, and GPS coordinates
-without comparing the requesting user's identity to `vehicle.getOwner()`.
+`JwtProvider.validateJwtToken` parses tokens via `SignedJWT.parse`. When that
+throws `ParseException`, the catch block falls back to `PlainJWT.parse` and
+returns `true` — unsigned tokens are accepted as valid. A forged
+`alg:none` JWT with `sub=admin@example.com` returned admin's seeded vehicle
+data (VIN `6NBBY70FWUM324316`, Audi RS7) on
+`GET /identity/api/v2/vehicle/vehicles`; the same endpoint without a token
+returns 401.
 
-A freshly signed-up attacker's JWT successfully retrieved Adam's full PII +
-GPS coordinates by querying his vehicle UUID:
+### f-002 / f-003 — JWT key trust bugs
+
+`JwtProvider` accepts a `jku` (JWK Set URL) claim in the JWT header for
+non-HS256 algorithms and unconditionally fetches that URL to load a JWKS
+into the trust set. The exploiter agent stood up an HTTP server inside the
+sandbox, served its own JWKS, and forged an RS256 token signed with its
+private key — `pointing the server at its own attacker JWKS`. The forged
+admin token was accepted on the same vehicle endpoint, returning admin's
+PII. (HS256 confusion via the base64-DER public key was attempted; the
+deployed Nimbus JWT version rejected it. The JKU path was the working
+exploit.)
+
+### f-004 — BOLA on vehicle location
+
+`GET /identity/api/v2/vehicle/{carId}/location` looks up the vehicle by UUID
+and returns owner `fullName`, `email`, and GPS coordinates without comparing
+the requesting user's identity to `vehicle.getOwner()`. A `test@example.com`
+user retrieved Adam's vehicle location:
 
 ```
 HTTP 200
-{
-  "carId": "f89b5f21-7829-45cb-a650-299a61090378",
+{ "carId": "f89b5f21-7829-45cb-a650-299a61090378",
   "fullName": "Adam",
   "email": "adam007@example.com",
-  "vehicleLocation": { "latitude": "32.778889", "longitude": "-91.919243" }
-}
+  "vehicleLocation": { "latitude": "32.778889", "longitude": "-91.919243" } }
 ```
 
-### f-002 — `alg:none` JWT acceptance
+### f-005 — BFLA: admin video delete
 
-`JwtProvider.validateJwtToken` parses the token via `SignedJWT.parse`. When
-that throws `ParseException`, the catch block falls back to
-`PlainJWT.parse(authToken)` and returns `true` — accepting unsigned tokens as
-valid.
+A regular signed-up user uploaded a video at `POST /identity/api/v2/user/videos`
+(id=53). Hitting `DELETE /identity/api/v2/user/videos/53` with a non-admin
+token returns 403 — but the response message helpfully points at the admin
+endpoint. Hitting `DELETE /identity/api/v2/admin/videos/53` with the *same*
+non-admin token returned 200 with `"User video deleted successfully"`. The
+admin path was missing its role check.
 
-Two forged unsigned tokens (`{"alg":"none"}` for `admin@example.com` and
-`adam007@example.com`) were sent to `/identity/api/v2/user/dashboard` and
-`/identity/api/v2/vehicle/vehicles`. Both returned HTTP 200 with full PII
-matching the forged `sub` claim.
+### f-006 — SSRF + bearer-token exfiltration
 
-### f-003 — RS256 → HS256 algorithm confusion
+`workshop.merchant.ContactMechanicView.post` accepts a `mechanic_api` URL
+from the request body and forwards the call (including the caller's
+`Authorization` header) to that URL. The exploiter started a logging HTTP
+server inside the sandbox, sent the request with `mechanic_api` pointing at
+it, and observed both the synthetic `{"success":true}` reply mirrored by the
+API and the victim's bearer token captured in the listener log.
 
-When the JWT header advertises `alg=HS256`, `getJwtSecret()`
-base64-encodes the RSA public key bytes and uses that string as the HMAC
-secret for `MACVerifier`. The JWKS endpoint (`/identity/api/v2/jwks.json`) is
-exposed unauthenticated, so the public key is trivially fetchable.
+### f-007 — SQL injection via coupon code
 
-Forging a token with `alg=HS256` and signing it with the base64-encoded
-public key as HMAC secret bypasses signature verification:
+`ApplyCouponView` builds a raw SQL string by concatenating the
+user-controlled `coupon_code` field. `coupon_code = "' UNION SELECT email
+FROM user_login WHERE '1'='1"` returned 400 with the leaked email
+concatenated into the response message — confirming arbitrary SQL execution
+against the `user_login` table.
+
+### f-008 — NoSQL injection in coupon validation
+
+`coupon_controller.ValidateCoupon` (Go service) passes the request JSON
+straight into a MongoDB `FindOne`. A payload of
+`{"coupon_code": {"$regex": ".*"}}` returned a real coupon
+(`TRAC075`, amount 75) — proving the Go handler does not flatten or
+validate operator-shaped values.
+
+### f-009 — Path traversal via double URL-encoding
+
+`mechanic.download_report` validates the `filename` query param with a regex
+that permits `%HH` sequences, then passes the result through `unquote()`
+**after** validation. A double-encoded payload (`%252e%252e%252f...`) passes
+the regex, the `unquote()` decodes it to `../../../etc/passwd`, and
+`os.path.abspath` resolves outside the report directory. The endpoint
+returned `/etc/passwd` (`root:x:0:0:root:/root:/bin/sh\n...`).
+
+### f-010 — Cross-service `alg:none` trust
+
+`workshop.utils.jwt` decodes incoming tokens with
+`jwt.decode(..., options={"verify_signature": False})` and trusts the `sub`
+claim. Combined with f-001 (identity service `/verify` accepts `alg:none`),
+a forged `alg:none` token for `adam007@example.com` returned that user's
+order history at `GET /workshop/api/shop/orders/all`. Demonstrates how a
+single auth bug (f-001) compounds into a cross-service identity-spoofing
+primitive.
+
+Per-finding evidence (request log, response excerpts, source references) is
+in `findings/opencode-runs/<timestamp>/verdicts/*.json`.
+
+## Strategies — one folder per coding agent
+
+The repo holds one strategy per coding agent. Each one adapts to its tool's
+native primitives: opencode has agents + MCP, Claude Code has subagents +
+the agents API, Codex has its own runtime. The shared piece across all
+three is the `apisec-runner` sandbox container — same toolkit, different
+front ends.
 
 ```
-HTTP 200 GET /identity/api/v2/user/dashboard
-{ "id": ..., "name": "Admin", "email": "admin@example.com",
-  "role": "ROLE_ADMIN", "available_credit": 100.0 }
+.
+├── docker/apisec-runner/      # SHARED — the sandbox container image
+│   ├── Dockerfile             # Debian slim + curl/httpie/jwt_tool/sqlmap/ffuf/...
+│   └── TOOLS.md               # manifest + recipes the agent reads at runtime
+│
+├── opencode/                  # opencode strategy — IMPLEMENTED
+│   ├── agents/{surveyor,hunter,exploiter}.md
+│   ├── mcp/apisec-bridge.py
+│   ├── opencode.json
+│   ├── run.sh
+│   └── README.md
+│
+├── claude/                    # Claude Code strategy — PLANNED
+└── codex/                     # Codex strategy — PLANNED
 ```
 
-### f-004 — JKU header → SSRF + arbitrary key injection
+### How the opencode strategy works
 
-For non-`HS256` tokens, `getKeyFromJkuHeader` extracts the `jku` (JWK Set URL)
-claim from the JWT header, makes an unfettered HTTP request to that URL, and
-loads the returned JWKS as a trusted key set. Any RSA public key the
-attacker serves is accepted for signature verification.
-
-Standing up a tiny HTTP server with the attacker's RSA public key:
+A three-stage pipeline of native opencode agents, each declared as a
+markdown file with YAML frontmatter that constrains its tool access. All
+shell execution is routed through an MCP server that proxies into a
+read-only-filesystem Podman container.
 
 ```
-http://host.containers.internal:9999/jwks.json
+                 ┌─────────────────────────────────────┐
+                 │  opencode serve  (host, port 4097)  │
+                 └─────────────┬───────────────────────┘
+                               │ opencode run --attach :4097 --agent X
+                               ▼
+                 ┌──────────────────────────────────────────┐
+   surveyor ──▶  │  read / grep / glob          (native)    │ ──▶  survey.json
+   (no exec)     │  bash / edit / write       — DENIED      │
+                 └──────────────────────────────────────────┘
+                               │
+                               ▼
+                 ┌──────────────────────────────────────────┐
+   hunter   ──▶  │  read / grep / glob          (native)    │ ──▶  findings.json
+   (live probe)  │  apisec-sandbox_bash         (MCP)       │      [N findings]
+                 │  bash                       — DENIED     │
+                 └──────────────┬───────────────────────────┘
+                                │ apisec-sandbox_bash
+                                ▼
+                  ┌──────────────────────────────────────┐
+                  │  MCP bridge (stdio)                  │
+                  │  python3 opencode/mcp/apisec-bridge  │
+                  └──────────────┬───────────────────────┘
+                                 │ podman exec apisec-sandbox bash -lc ...
+                                 ▼
+                  ┌──────────────────────────────────────┐
+                  │  apisec-sandbox container            │
+                  │  toolkit + /workspace (RO source)    │
+                  │  /sandbox (RW tmpfs) + TOOLS.md      │
+                  │  network: --network=host             │
+                  └──────────────┬───────────────────────┘
+                                 │ HTTP
+                                 ▼
+                  ┌──────────────────────────────────────┐
+                  │  Target API (e.g. crAPI :8888)       │
+                  └──────────────────────────────────────┘
+                               │
+   exploiter ─▶  per-finding loop ─▶ verdicts/<id>.json (CONFIRMED|FAILED|UNCLEAR)
 ```
 
-A forged RS256 token with `jku` pointing at that URL and signed with the
-attacker's matching private key was accepted. Bonus: the `jku` fetch is a
-classic SSRF primitive (the server will fetch any URL).
+What each piece is doing:
 
-### f-005 — Unauthenticated PII leak via dashboard
+- **Custom agents (`opencode/agents/*.md`)** — opencode reads these from
+  `<workspace>/.opencode/agents/` (we install per-file symlinks at run
+  time). Each agent's YAML frontmatter sets `permission` rules that
+  whitelist exactly the tools it needs and deny the rest. The hunter and
+  exploiter both have `bash: deny` (no host shell) and
+  `apisec-sandbox_bash: allow` (only the sandboxed shell). The native
+  `read`/`grep`/`glob` are kept for static analysis on the read-only
+  source tree.
 
-`GET /identity/api/v2/user/dashboard` is `permitAll()` in `WebSecurityConfig`,
-and the controller calls `getUserByRequestToken` which internally invokes
-`getUserFromTokenWithoutValidation` — JWT signature is never checked. Any
-unsigned JWT carrying a `sub` claim returns the corresponding user's full
-profile.
+- **MCP server (`opencode/mcp/apisec-bridge.py`)** — a small stdio
+  JSON-RPC bridge (~200 lines, stdlib only). opencode spawns it on
+  startup and discovers its `bash` tool. Each `tools/call` becomes
+  `podman exec apisec-sandbox bash -lc "<cmd>"` against the running
+  container; output (truncated to 64 KB) returns as the tool result.
 
-```
-GET /identity/api/v2/user/dashboard
-Authorization: Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSJ9.
+- **Sandbox container (`docker/apisec-runner/`)** — a Debian-slim image
+  with the API hacking toolkit (curl, httpie, jwt_tool, jwt-cli, sqlmap,
+  ffuf, gobuster, kr, arjun, python httpx/pyjwt/cryptography, jq, db
+  clients, SecLists wordlists). The project source is mounted read-only
+  at `/workspace`. `/sandbox` is a writable tmpfs (200 MB) for exploit
+  scripts and attacker-controlled servers. The container reads
+  `/sandbox/TOOLS.md` on first call to learn its environment and recipes.
 
-HTTP 200
-{ "id": 5, "name": "Admin", "email": "admin@example.com",
-  "number": "9010203040", "role": "ROLE_ADMIN",
-  "available_credit": 100.0 }
-```
+- **Cross-finding context** — running each agent through one shared
+  `opencode serve` lets the prompt-cache hit rate stay high (the survey
+  is 30k+ tokens of source context that gets reused across hunter calls
+  and across all per-finding exploiter calls). A 10-finding run lands
+  around `$0.05–$0.15` total with DeepSeek-V4-Pro.
 
-Full per-finding evidence (request log, response excerpts, source
-references) is in `findings/verified-latest.json`.
+- **Why a sandbox at all** — the agent freely runs `curl`, custom Python
+  scripts, attacker-controlled HTTP listeners on tmpfs ports, etc. Doing
+  that against a target on the host means the agent's "hands" need to
+  be somewhere we can throw away — read-only filesystem + tmpfs scratch
+  + a fixed toolkit. The container is destroyed at the end of every run.
+
+### Claude Code and Codex strategies (planned)
+
+The two upcoming folders will keep the same external contract — a single
+`run.sh` that produces a `survey.json`, `findings.json`, and one
+`verdicts/<id>.json` per finding — but use each tool's native primitives:
+
+- **`claude/`** — Claude Code subagents (`.claude/agents/*.md`) for
+  surveyor / hunter / exploiter, with the same MCP `apisec-bridge`
+  re-exposed via Claude Code's MCP support. The Claude Code Agents API
+  may also be a fit for orchestration.
+
+- **`codex/`** — Codex's tool definitions and built-in container/sandbox
+  flags. Codex already has a `--dangerously-bypass-approvals-and-sandbox`
+  mode and tool-spec config; we wire those instead of writing a new MCP.
+
+In all three cases the `docker/apisec-runner/` image and `TOOLS.md`
+manifest are shared. Only the agent definitions and the orchestration
+glue change.
 
 ## Repository layout
 
 ```text
 .
 ├── docker/
-│   └── poc-runner/        # Podman image for sandboxed PoC execution
-├── findings/              # candidate JSONs + verified runs + run records
-├── scripts/
-│   ├── 01_detect.py       # source-aware candidate finding generation
-│   ├── 02_verify.py       # PoC generation + sandbox or direct execution
-│   ├── 03_demo.py         # end-to-end orchestration
-│   ├── api.py             # opencode HTTP server lifecycle + run-attach helpers
-│   ├── common.py          # LLM invocation, JSON parsing, run recorder
-│   ├── models.py          # Pydantic schemas for findings/verifications
-│   └── sandbox_mcp.py     # Podman PoC runner
+│   ├── apisec-runner/         # NEW — sandbox image + TOOLS.md (used by opencode)
+│   └── poc-runner/            # legacy — Python PoC sandbox used by scripts/02_verify.py
+├── opencode/                  # opencode strategy (see opencode/README.md)
+├── findings/                  # candidate JSONs, verified runs, opencode-runs/
+├── scripts/                   # legacy Python orchestrator (Claude/Codex/opencode CLI)
+│   ├── 01_detect.py
+│   ├── 02_verify.py
+│   ├── 03_demo.py
+│   ├── api.py
+│   ├── common.py
+│   ├── models.py
+│   └── sandbox_mcp.py
 ├── pyproject.toml
 └── uv.lock
 ```

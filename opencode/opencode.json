@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "apisec-sandbox": {
+      "type": "local",
+      "command": ["python3", "./opencode/mcp/apisec-bridge.py"],
+      "environment": {
+        "SANDBOX_CONTAINER": "apisec-sandbox",
+        "SANDBOX_RUNTIME": "podman",
+        "SANDBOX_TIMEOUT": "120",
+        "SANDBOX_OUT_LIMIT": "65536"
+      },
+      "enabled": true,
+      "timeout": 120000
+    }
+  }
+}

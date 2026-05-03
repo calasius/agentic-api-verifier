@@ -7,4 +7,6 @@ findings/candidates-*.json
 findings/verified-*.json
 findings/demo-run-*.json
 findings/runs/*.json
+findings/opencode-runs/
 crAPI/
+.opencode/
