@@ -465,6 +465,10 @@ The reports under `reports/` are produced after the verify loop ends by
 events vs. Claude wrapped events) and renders a phase-by-phase narrative
 with the bash commands, tool results, and final verdict — JWTs redacted.
 
+Real samples are in [`docs/sample-reports/`](docs/sample-reports/) — 13
+findings × 2 strategies = 26 markdown reports from actual runs against
+crAPI.
+
 The verdict schema is:
 
 ```
