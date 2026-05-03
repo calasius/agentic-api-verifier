@@ -223,7 +223,7 @@ Use mcp__apisec_sandbox__bash for all HTTP and exec.
 $FINDING
 </finding>"
 
-    TMP_JSONL="$RUN_DIR/exploiter-tmp.jsonl"
+    PER_JSONL="$RUN_DIR/exploiter-${FID}.jsonl"
     ( cd "$WORKSPACE_DIR" && claude -p \
         --output-format stream-json \
         --include-partial-messages \
@@ -235,15 +235,30 @@ $FINDING
         --max-turns "$MAX_TURNS" \
         --dangerously-skip-permissions \
         "$PROMPT" ) \
-        > "$TMP_JSONL" 2>>"$RUN_DIR/exploiter.err" || \
+        > "$PER_JSONL" 2>>"$RUN_DIR/exploiter.err" || \
         log "  [$FID] claude exited non-zero (continuing)"
 
-    cat "$TMP_JSONL" >> "$RUN_DIR/exploiter.jsonl"
+    cat "$PER_JSONL" >> "$RUN_DIR/exploiter.jsonl"
 
-    python3 "$REPO_ROOT/claude/parse-stream.py" "$TMP_JSONL" status \
+    python3 "$REPO_ROOT/claude/parse-stream.py" "$PER_JSONL" status \
         > "$RUN_DIR/verdicts/$FID.json"
+done
 
-    rm -f "$TMP_JSONL"
+# ─── reports: one markdown attack-chain per finding ──────────────────────────
+mkdir -p "$RUN_DIR/reports"
+for i in $(seq 0 $((COUNT - 1))); do
+    FID=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['findings'][$i]['id'])" "$RUN_DIR/findings.json")
+    PER_JSONL="$RUN_DIR/exploiter-${FID}.jsonl"
+    [[ -e "$PER_JSONL" ]] || continue
+    python3 -c "import json,sys; json.dump(json.load(open(sys.argv[1]))['findings'][$i], sys.stdout)" \
+        "$RUN_DIR/findings.json" > "$RUN_DIR/reports/${FID}.finding.json"
+    python3 "$REPO_ROOT/lib/build-report.py" \
+        "$PER_JSONL" \
+        "$RUN_DIR/reports/${FID}.finding.json" \
+        --verdict "$RUN_DIR/verdicts/${FID}.json" \
+        > "$RUN_DIR/reports/${FID}.md" 2>/dev/null && \
+        log "  report: ${FID}.md"
+    rm -f "$RUN_DIR/reports/${FID}.finding.json"
 done
 
 # ─── 6. summary ──────────────────────────────────────────────────────────────

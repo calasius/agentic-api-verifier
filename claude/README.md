@@ -95,12 +95,21 @@ Flags:
 Output goes to `findings/claude-runs/<timestamp>/`:
 
 ```
-survey.json           # surveyor output
-findings.json         # hunter output
-verdicts/<id>.json    # one per finding from exploiter
-*.jsonl               # raw streamed JSON events from each agent
-mcp.json              # the per-run MCP config used
+survey.json                  # surveyor output
+findings.json                # hunter output
+verdicts/<id>.json           # one per finding from exploiter
+reports/<id>.md              # markdown attack-chain report per finding
+exploiter-<id>.jsonl         # per-finding raw stream events
+exploiter.jsonl              # all exploiter streams concatenated
+surveyor.jsonl, hunter.jsonl # phase streams
+mcp.json                     # the per-run MCP config used
 ```
+
+The `reports/<id>.md` files are auto-generated at the end of the run by
+`lib/build-report.py` from each finding's stream. They group the agent's
+text+tool events into phases, render bash commands as fenced blocks,
+redact JWTs, and render the verdict at the end. Read them with `glow`,
+`bat`, your IDE's markdown preview, or just `less`.
 
 ## Watching progress live
 

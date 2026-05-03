@@ -268,7 +268,7 @@ $FINDING
     # Write opencode's stream to a per-finding temp jsonl (avoids the
     # heredoc-stomps-pipe-stdin trap), then append it to the master
     # exploiter.jsonl, then parse the verdict text out of it.
-    TMP_JSONL="$RUN_DIR/exploiter-tmp.jsonl"
+    PER_JSONL="$RUN_DIR/exploiter-${FID}.jsonl"
     opencode run \
         --attach "$ATTACH" \
         --format json \
@@ -277,15 +277,15 @@ $FINDING
         --agent exploiter \
         --dir "$WORKSPACE_DIR" \
         "$PROMPT" \
-        > "$TMP_JSONL" 2>>"$RUN_DIR/exploiter.err" || \
+        > "$PER_JSONL" 2>>"$RUN_DIR/exploiter.err" || \
         log "  [$FID] opencode run exited non-zero (continuing)"
 
-    cat "$TMP_JSONL" >> "$RUN_DIR/exploiter.jsonl"
+    cat "$PER_JSONL" >> "$RUN_DIR/exploiter.jsonl"
 
     # Pass the jsonl path as argv (don't redirect stdin) — `python3 -` plus
     # a `<<HERE` heredoc would otherwise consume stdin to read the script,
     # leaving sys.stdin empty when the script tries to iterate.
-    python3 - "$TMP_JSONL" > "$RUN_DIR/verdicts/$FID.json" <<'PY'
+    python3 - "$PER_JSONL" > "$RUN_DIR/verdicts/$FID.json" <<'PY'
 import json, re, sys
 text_parts = []
 with open(sys.argv[1]) as f:
@@ -302,8 +302,23 @@ m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
 if m: text = m.group(1)
 sys.stdout.write(text)
 PY
+done
 
-    rm -f "$TMP_JSONL"
+# ─── reports: one markdown attack-chain per finding ──────────────────────────
+mkdir -p "$RUN_DIR/reports"
+for i in $(seq 0 $((COUNT - 1))); do
+    FID=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['findings'][$i]['id'])" "$RUN_DIR/findings.json")
+    PER_JSONL="$RUN_DIR/exploiter-${FID}.jsonl"
+    [[ -e "$PER_JSONL" ]] || continue
+    python3 -c "import json,sys; json.dump(json.load(open(sys.argv[1]))['findings'][$i], sys.stdout)" \
+        "$RUN_DIR/findings.json" > "$RUN_DIR/reports/${FID}.finding.json"
+    python3 "$REPO_ROOT/lib/build-report.py" \
+        "$PER_JSONL" \
+        "$RUN_DIR/reports/${FID}.finding.json" \
+        --verdict "$RUN_DIR/verdicts/${FID}.json" \
+        > "$RUN_DIR/reports/${FID}.md" 2>/dev/null && \
+        log "  report: ${FID}.md"
+    rm -f "$RUN_DIR/reports/${FID}.finding.json"
 done
 
 # ─── 7. summary ──────────────────────────────────────────────────────────────

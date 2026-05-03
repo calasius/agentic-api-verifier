@@ -455,8 +455,15 @@ Every run writes to `findings/<agent>-runs/<timestamp>/`:
 survey.json           # surveyor output
 findings.json         # hunter output
 verdicts/<id>.json    # one per finding from the exploiter
-*.jsonl               # raw streamed events from each phase
+reports/<id>.md       # markdown attack-chain report per finding (auto-generated)
+exploiter-<id>.jsonl  # per-finding raw stream events
+*.jsonl               # phase streams (surveyor, hunter, exploiter master)
 ```
+
+The reports under `reports/` are produced after the verify loop ends by
+`lib/build-report.py`, which auto-detects the stream format (opencode flat
+events vs. Claude wrapped events) and renders a phase-by-phase narrative
+with the bash commands, tool results, and final verdict — JWTs redacted.
 
 The verdict schema is:
 
