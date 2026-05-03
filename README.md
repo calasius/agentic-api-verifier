@@ -1,150 +1,77 @@
 # Coding Agents for Vulnerability Discovery and Exploitation
 
-Proof of concept for using coding agents (Claude Code, OpenAI Codex, opencode +
-DeepSeek-V4-Pro) to automatically detect candidate API vulnerabilities,
-generate executable proof-of-concept exploits, run them against a live target,
-and return a structured verdict.
+Proof of concept for letting coding agents (Claude Code, opencode +
+DeepSeek-V4-Pro, …) automatically detect candidate API vulnerabilities,
+generate executable proof-of-concept exploits, run them against a live
+target, and return a structured verdict.
 
 This is a research PoC, not a production scanner. The goal is to show what's
-realistic today when you let an agent both reason about source and execute
+realistic today when you let an agent reason about source **and** execute
 HTTP requests end-to-end.
+
+---
 
 ## What it does
 
-Given a target source tree and a running instance of the application, the PoC
-runs three stages:
+Given a target source tree and a running instance of the application, the
+PoC runs three stages, each as an independent agent invocation:
 
-1. **Detect** — the agent reads the source, identifies candidate vulnerabilities
-   (OWASP API Top 10 by default), and emits operational findings: file/line,
+1. **Survey** — the agent reads the source, identifies stack, routes, auth
+   model, trust boundaries, seeded test data, and "suspicious patterns".
+   Does **not** name vulnerabilities. Output: `survey.json`.
+2. **Hunt** — given the survey, the agent looks for OWASP API Top 10
+   vulnerabilities and emits **operational findings**: file/line,
    hypothesis, attack request, setup steps, expected response signal.
-2. **Verify** — for each finding, the agent generates and runs an exploit
-   against the live target. Two execution paths are supported:
-   - PoC-in-sandbox: the agent emits Python code, the demo runs it inside an
-     isolated Podman container with a fixed `TARGET_URL`.
-   - Direct execution: the agent itself drives `curl`/HTTP via its `Bash` tool
-     against the target (no sandbox, no Python layer).
-3. **Verdict** — each finding ends as `CONFIRMED`, `FAILED`, or `UNCLEAR` with
-   captured HTTP evidence (requests, responses, status codes).
+   Output: `findings.json`.
+3. **Exploit** — for each finding, the agent generates and runs the
+   exploit against the live target inside an isolated container, then
+   compares the response against the predicted signal. Output:
+   `verdicts/<id>.json`, each one `CONFIRMED | FAILED | UNCLEAR`.
 
 `UNCLEAR` matters: a real triage tool needs to admit when it can't prove
 something instead of guessing.
 
-## Supported coding agents
+## One folder per coding agent, one shared sandbox image
 
-Selectable via `--llm {claude,codex,opencode}`.
+The repo is structured as a small matrix: each coding agent gets its own
+folder with the orchestration glue and prompts that fit its native
+primitives, and they all share a single Podman image for the actual
+exploit-runtime sandbox.
 
-- **Claude Code** (`claude` CLI) — default. Recommended models:
-  `claude-opus-4-7` for detection, `claude-sonnet-4-6` for PoC generation.
-- **OpenAI Codex** (`codex` CLI) — works with GPT-class models.
-- **opencode** — runs DeepSeek-V4-Pro (and other providers) through the
-  Vercel AI SDK. Two execution modes:
-  - CLI per call: `opencode run` invoked once per detect/verify.
-  - Persistent server (`--use-api`): one `opencode serve` shared across calls
-    via `opencode run --attach`. Faster when there are many findings.
-
-DeepSeek-V4-Pro is interesting because it's cheap (~$0.01 per finding verified
-end-to-end) and supports tool calling reliably through opencode, so it can
-drive `Bash`/`Read`/`Grep`/`Glob` directly during verification.
-
-Custom invocations are supported via env vars: `CLAUDE_COMMAND`,
-`CLAUDE_EXEC_FLAGS`, `CODEX_COMMAND`, `CODEX_EXEC_FLAGS`, `OPENCODE_COMMAND`,
-`OPENCODE_EXEC_FLAGS`.
-
-## Example target: OWASP crAPI
-
-The default target wired into the prompts is OWASP crAPI ("completely
-ridiculous API"), an intentionally vulnerable Java/Spring Boot training app
-with deliberate OWASP API Top 10 issues. Any other intentionally-vulnerable
-app with a similar source layout (WebGoat, VAmPI, Juice Shop, DVWS) can be
-swapped in by editing the prompts in `01_detect.py` and `02_verify.py`.
-
-### crAPI architecture
-
-```mermaid
-flowchart TB
-    user["Browser / API Client"]
-    agent["Coding agent<br/>(detect + verify)"]
-    sandbox["Podman PoC sandbox<br/>(optional)"]
-
-    subgraph host["Local host"]
-        user
-        agent
-        sandbox
-    end
-
-    subgraph crapi["OWASP crAPI (Podman Compose)"]
-        web["crapi-web<br/>OpenResty / Web UI<br/>localhost:8888"]
-        identity["crapi-identity<br/>Java<br/>users, auth, JWT, OTP, vehicles"]
-        workshop["crapi-workshop<br/>Python<br/>mechanics, services, orders"]
-        community["crapi-community<br/>Go<br/>posts and comments"]
-        chatbot["crapi-chatbot<br/>assistant / MCP-style service"]
-        gateway["gateway-service<br/>api.mypremiumdealership.com"]
-        mailhog["mailhog<br/>test email inbox<br/>localhost:8025"]
-        postgres[("postgresdb<br/>SQL data")]
-        mongo[("mongodb<br/>NoSQL data + mail storage")]
-        chroma[("chromadb<br/>chatbot retrieval store")]
-    end
-
-    user -->|"HTTP UI/API"| web
-    agent -->|"source analysis"| identity
-    agent -->|"generates PoC"| sandbox
-    agent -->|"direct HTTP (verify mode)"| web
-    sandbox -->|"HTTP evidence"| web
-
-    web --> identity
-    web --> workshop
-    web --> community
-    web --> chatbot
-    web --> mailhog
-
-    identity --> postgres
-    identity --> mongo
-    identity --> mailhog
-    identity --> gateway
-
-    workshop --> postgres
-    workshop --> mongo
-    workshop --> identity
-    workshop --> gateway
-
-    community --> postgres
-    community --> mongo
-    community --> identity
-
-    chatbot --> identity
-    chatbot --> mongo
-    chatbot --> chroma
-
-    classDef external fill:#eef2ff,stroke:#4f46e5,color:#111827,stroke-width:2px;
-    classDef agentNode fill:#ecfeff,stroke:#0891b2,color:#0f172a,stroke-width:2px;
-    classDef edge fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:2px;
-    classDef service fill:#f0fdf4,stroke:#16a34a,color:#052e16,stroke-width:2px;
-    classDef data fill:#fff7ed,stroke:#ea580c,color:#431407,stroke-width:2px;
-    classDef infra fill:#fdf2f8,stroke:#db2777,color:#500724,stroke-width:2px;
-
-    class user external;
-    class agent,sandbox agentNode;
-    class web edge;
-    class identity,workshop,community,chatbot service;
-    class postgres,mongo,chroma data;
-    class mailhog,gateway infra;
+```
+.
+├── docker/apisec-runner/        # SHARED — sandbox container image + TOOLS.md
+│
+├── opencode/                    # opencode strategy
+│   ├── agents/                  #   custom agents (markdown + YAML frontmatter)
+│   ├── mcp/apisec-bridge.py     #   stdio MCP server: JSON-RPC ↔ podman exec
+│   ├── opencode.json            #   project-local opencode config (template)
+│   ├── run.sh                   #   end-to-end orchestrator
+│   └── README.md
+│
+├── claude/                      # Claude Code strategy
+│   ├── agents/                  #   subagents (markdown + YAML frontmatter)
+│   ├── mcp/apisec-bridge.py     #   symlink → opencode/mcp/apisec-bridge.py
+│   ├── run.sh                   #   end-to-end orchestrator
+│   ├── watch.sh                 #   pretty-print live phase logs
+│   └── README.md
+│
+└── findings/                    # outputs (gitignored)
+    ├── opencode-runs/<ts>/
+    └── claude-runs/<ts>/
 ```
 
-For a fast walk-through, scope can be bounded to a single service like
-`services/identity` (authentication, authorization, JWT/OTP, account,
-vehicle code paths). The opencode strategy below scans the entire repo by
-default — see the sample run for a full-tree result that covers all four
-services.
+The `apisec-bridge.py` MCP server and the `apisec-runner` container image
+are shared verbatim. Only the agent definitions and the orchestration glue
+(`run.sh`) change between strategies.
 
 ## Sample run: 10/10 confirmed across all crAPI services
 
-Latest end-to-end run with the opencode strategy (DeepSeek-V4-Pro, three
-agents — surveyor, hunter, exploiter — with all execution routed through
-the `apisec-sandbox` container) returned **10 CONFIRMED, 0 FAILED, 0
-UNCLEAR**, with HTTP evidence captured per finding. The hunter explored all
-four crAPI services in three different languages — `services/identity`
-(Java/Spring), `services/workshop` (Python/Django), `services/community`
-(Go) — and produced findings spanning **6 OWASP API Top 10 categories**.
+Latest end-to-end run with the opencode strategy (DeepSeek-V4-Pro)
+returned **10 CONFIRMED, 0 FAILED, 0 UNCLEAR**, with HTTP evidence
+captured per finding. The hunter explored all four crAPI services
+(Java/Spring, Python/Django, Go) and produced findings spanning
+**6 OWASP API Top 10 categories**.
 
 | ID    | OWASP     | Class                            | File:line                                                 |
 |-------|-----------|----------------------------------|-----------------------------------------------------------|
@@ -159,384 +86,292 @@ four crAPI services in three different languages — `services/identity`
 | f-009 | API8:2023 | Path traversal (double-encoding)  | `services/workshop/crapi/mechanic/views.py:395`           |
 | f-010 | API2:2023 | Cross-service `alg:none` trust    | `services/workshop/utils/jwt.py:61`                       |
 
-### f-001 — `alg:none` JWT acceptance
+Total cost ~$0.066 with prompt caching. Per-finding evidence (request log,
+response excerpts, source references) is in
+`findings/opencode-runs/<timestamp>/verdicts/*.json`.
 
-`JwtProvider.validateJwtToken` parses tokens via `SignedJWT.parse`. When that
-throws `ParseException`, the catch block falls back to `PlainJWT.parse` and
-returns `true` — unsigned tokens are accepted as valid. A forged
-`alg:none` JWT with `sub=admin@example.com` returned admin's seeded vehicle
-data (VIN `6NBBY70FWUM324316`, Audi RS7) on
-`GET /identity/api/v2/vehicle/vehicles`; the same endpoint without a token
-returns 401.
+---
 
-### f-002 / f-003 — JWT key trust bugs
+## The shared sandbox: `apisec-runner`
 
-`JwtProvider` accepts a `jku` (JWK Set URL) claim in the JWT header for
-non-HS256 algorithms and unconditionally fetches that URL to load a JWKS
-into the trust set. The exploiter agent stood up an HTTP server inside the
-sandbox, served its own JWKS, and forged an RS256 token signed with its
-private key — `pointing the server at its own attacker JWKS`. The forged
-admin token was accepted on the same vehicle endpoint, returning admin's
-PII. (HS256 confusion via the base64-DER public key was attempted; the
-deployed Nimbus JWT version rejected it. The JKU path was the working
-exploit.)
+Both strategies route every shell call into the same container. Treat it as
+the agent's "hands": a writable scratch space + a fixed toolkit + read-only
+access to the source. The agent's "brain" (the LLM) stays on the host;
+only its commands run inside.
 
-### f-004 — BOLA on vehicle location
+### What's in the image
 
-`GET /identity/api/v2/vehicle/{carId}/location` looks up the vehicle by UUID
-and returns owner `fullName`, `email`, and GPS coordinates without comparing
-the requesting user's identity to `vehicle.getOwner()`. A `test@example.com`
-user retrieved Adam's vehicle location:
+`docker/apisec-runner/Dockerfile` builds on Debian 12 slim and pre-installs:
 
-```
-HTTP 200
-{ "carId": "f89b5f21-7829-45cb-a650-299a61090378",
-  "fullName": "Adam",
-  "email": "adam007@example.com",
-  "vehicleLocation": { "latitude": "32.778889", "longitude": "-91.919243" } }
-```
+| Category   | Tools                                                           |
+|------------|-----------------------------------------------------------------|
+| HTTP       | `curl`, `httpie` (`http`/`https`), `wget`, python `httpx`/`requests`/`aiohttp`, node `fetch` |
+| JWT/crypto | `openssl`, `jwt` (jwt-cli), `jwt_tool` (ticarpi), `pyjwt[crypto]`, `python-jose`, `cryptography` |
+| JSON/parse | `jq`, `yq`, `xmlstarlet`, `base64`, `xxd`                        |
+| Recon      | `ffuf`, `gobuster`, `kr` (kiterunner), `arjun`                   |
+| SQL        | `sqlmap`                                                         |
+| DB clients | `psql`, `mysql`, `redis-tools`                                   |
+| Network    | `dig`, `nslookup`, `nc`, `socat`, `ping`                         |
+| General    | `git`, `unzip`, `tar`, `tree`, `vim-tiny`                        |
+| Languages  | `python3` (with httpx/pyjwt/cryptography preloaded), `node 18+`  |
+| Wordlists  | SecLists subset at `/usr/share/wordlists/{api-objects,api-actions,common,raft-small-words}.txt` |
 
-### f-005 — BFLA: admin video delete
+Plus `docker/apisec-runner/TOOLS.md` — a markdown manifest with **recipes
+per attack class** (alg:none forge, RS↔HS confusion, JKU injection, BOLA
+enumeration, sqlmap, ffuf, etc.). The agent reads it once at the start of a
+session to load the cookbook into context.
 
-A regular signed-up user uploaded a video at `POST /identity/api/v2/user/videos`
-(id=53). Hitting `DELETE /identity/api/v2/user/videos/53` with a non-admin
-token returns 403 — but the response message helpfully points at the admin
-endpoint. Hitting `DELETE /identity/api/v2/admin/videos/53` with the *same*
-non-admin token returned 200 with `"User video deleted successfully"`. The
-admin path was missing its role check.
+### How the container is run
 
-### f-006 — SSRF + bearer-token exfiltration
-
-`workshop.merchant.ContactMechanicView.post` accepts a `mechanic_api` URL
-from the request body and forwards the call (including the caller's
-`Authorization` header) to that URL. The exploiter started a logging HTTP
-server inside the sandbox, sent the request with `mechanic_api` pointing at
-it, and observed both the synthetic `{"success":true}` reply mirrored by the
-API and the victim's bearer token captured in the listener log.
-
-### f-007 — SQL injection via coupon code
-
-`ApplyCouponView` builds a raw SQL string by concatenating the
-user-controlled `coupon_code` field. `coupon_code = "' UNION SELECT email
-FROM user_login WHERE '1'='1"` returned 400 with the leaked email
-concatenated into the response message — confirming arbitrary SQL execution
-against the `user_login` table.
-
-### f-008 — NoSQL injection in coupon validation
-
-`coupon_controller.ValidateCoupon` (Go service) passes the request JSON
-straight into a MongoDB `FindOne`. A payload of
-`{"coupon_code": {"$regex": ".*"}}` returned a real coupon
-(`TRAC075`, amount 75) — proving the Go handler does not flatten or
-validate operator-shaped values.
-
-### f-009 — Path traversal via double URL-encoding
-
-`mechanic.download_report` validates the `filename` query param with a regex
-that permits `%HH` sequences, then passes the result through `unquote()`
-**after** validation. A double-encoded payload (`%252e%252e%252f...`) passes
-the regex, the `unquote()` decodes it to `../../../etc/passwd`, and
-`os.path.abspath` resolves outside the report directory. The endpoint
-returned `/etc/passwd` (`root:x:0:0:root:/root:/bin/sh\n...`).
-
-### f-010 — Cross-service `alg:none` trust
-
-`workshop.utils.jwt` decodes incoming tokens with
-`jwt.decode(..., options={"verify_signature": False})` and trusts the `sub`
-claim. Combined with f-001 (identity service `/verify` accepts `alg:none`),
-a forged `alg:none` token for `adam007@example.com` returned that user's
-order history at `GET /workshop/api/shop/orders/all`. Demonstrates how a
-single auth bug (f-001) compounds into a cross-service identity-spoofing
-primitive.
-
-Per-finding evidence (request log, response excerpts, source references) is
-in `findings/opencode-runs/<timestamp>/verdicts/*.json`.
-
-## Strategies — one folder per coding agent
-
-The repo holds one strategy per coding agent. Each one adapts to its tool's
-native primitives: opencode has agents + MCP, Claude Code has subagents +
-the agents API, Codex has its own runtime. The shared piece across all
-three is the `apisec-runner` sandbox container — same toolkit, different
-front ends.
+`run.sh` (in each strategy folder) does:
 
 ```
-.
-├── docker/apisec-runner/      # SHARED — the sandbox container image
-│   ├── Dockerfile             # Debian slim + curl/httpie/jwt_tool/sqlmap/ffuf/...
-│   └── TOOLS.md               # manifest + recipes the agent reads at runtime
-│
-├── opencode/                  # opencode strategy — IMPLEMENTED
-│   ├── agents/{surveyor,hunter,exploiter}.md
-│   ├── mcp/apisec-bridge.py
-│   ├── opencode.json
-│   ├── run.sh
-│   └── README.md
-│
-├── claude/                    # Claude Code strategy — IMPLEMENTED
-│   ├── agents/{surveyor,hunter,exploiter}.md
-│   ├── mcp/apisec-bridge.py   # symlink to opencode/mcp/apisec-bridge.py
-│   ├── run.sh
-│   └── README.md
-│
-└── codex/                     # Codex strategy — PLANNED
+podman run -d \
+    --name apisec-sandbox \
+    --network host \
+    --tmpfs /sandbox:rw,size=200m,mode=1777 \
+    --read-only --read-only-tmpfs \
+    --volume "$WORKSPACE_DIR:/workspace:ro" \
+    --env TARGET_URL=$TARGET_URL \
+    --env ORACLES_URL_EMAIL=... \
+    --env WORKSPACE=/workspace \
+    --env SCRATCH=/sandbox \
+    apisec-runner sleep infinity
 ```
 
-### How the opencode strategy works
+Properties this gives the agent:
+- `/workspace` is the project source, **read-only**.
+- `/sandbox` is the only writable surface, a 200 MB tmpfs that's gone the
+  moment the container exits.
+- `--read-only` rootfs prevents the agent from `pip install`ing new tools
+  or modifying anything outside `/sandbox`.
+- `--network host` keeps `localhost:<port>` reachable so the agent can hit
+  the target without dealing with Podman host-gateway aliases.
+  (Trade-off: the container shares the host's network namespace; this is
+  acceptable for an authorized PoC against a local target. For a stricter
+  setup, use a dedicated Podman network and bind the target there.)
 
-A three-stage pipeline of native opencode agents, each declared as a
-markdown file with YAML frontmatter that constrains its tool access. All
-shell execution is routed through an MCP server that proxies into a
-read-only-filesystem Podman container.
+### Extending the toolkit
+
+Three knobs:
+
+1. **Add a new tool to the image.** Edit `docker/apisec-runner/Dockerfile`
+   and add an `apt-get install` / `pip3 install` / direct binary download
+   line. Re-build: `podman build -t localhost/apisec-runner:latest
+   docker/apisec-runner/`. `run.sh --skip-build` reuses the cached image.
+
+2. **Tell the agent the new tool exists.** Add a recipe section to
+   `docker/apisec-runner/TOOLS.md` (`### Tool name — quick recipe`). The
+   agent reads this file at the start of each session, so an addition
+   propagates automatically — no prompt change needed.
+
+3. **Optional: expose a new MCP tool.** If the new capability shouldn't be
+   one shell command but its own first-class tool (e.g. a structured
+   "fetch-jwks" helper), add it to `opencode/mcp/apisec-bridge.py` next
+   to `bash` in the `TOOLS = [...]` list. The exact wire format is
+   documented in the bridge file.
+
+The image is intentionally portable across strategies: nothing in the
+Dockerfile or `TOOLS.md` references opencode or Claude Code specifically.
+
+---
+
+## Strategy 1: opencode
+
+`opencode/README.md` has the full quickstart. Here's the architectural
+view:
 
 ```
                  ┌─────────────────────────────────────┐
-                 │  opencode serve  (host, port 4097)  │
+                 │  opencode serve  (host, port 4096)  │
                  └─────────────┬───────────────────────┘
-                               │ opencode run --attach :4097 --agent X
+                               │ opencode run --attach :4096 --agent X
                                ▼
-                 ┌──────────────────────────────────────────┐
-   surveyor ──▶  │  read / grep / glob          (native)    │ ──▶  survey.json
-   (no exec)     │  bash / edit / write       — DENIED      │
-                 └──────────────────────────────────────────┘
-                               │
-                               ▼
-                 ┌──────────────────────────────────────────┐
-   hunter   ──▶  │  read / grep / glob          (native)    │ ──▶  findings.json
-   (live probe)  │  apisec-sandbox_bash         (MCP)       │      [N findings]
-                 │  bash                       — DENIED     │
-                 └──────────────┬───────────────────────────┘
+   surveyor ──▶  Read / Grep / Glob (native)             ──▶  survey.json
+                 bash, edit, write, MCP   — DENIED
+
+   hunter   ──▶  Read / Grep / Glob (native)             ──▶  findings.json
+                 apisec-sandbox_bash (MCP) — ALLOWED
+                 native bash             — DENIED
+
+   exploiter ─▶  Read / Grep / Glob (native)             ──▶  verdicts/<id>.json
+                 apisec-sandbox_bash (MCP) — ALLOWED      (one per finding)
+                 native bash             — DENIED
                                 │ apisec-sandbox_bash
                                 ▼
-                  ┌──────────────────────────────────────┐
-                  │  MCP bridge (stdio)                  │
-                  │  python3 opencode/mcp/apisec-bridge  │
-                  └──────────────┬───────────────────────┘
+                  ┌──────────────────────────────────┐
+                  │  MCP bridge (stdio JSON-RPC)     │
+                  │  python3 apisec-bridge.py        │
+                  └──────────────┬───────────────────┘
                                  │ podman exec apisec-sandbox bash -lc ...
                                  ▼
-                  ┌──────────────────────────────────────┐
-                  │  apisec-sandbox container            │
-                  │  toolkit + /workspace (RO source)    │
-                  │  /sandbox (RW tmpfs) + TOOLS.md      │
-                  │  network: --network=host             │
-                  └──────────────┬───────────────────────┘
-                                 │ HTTP
-                                 ▼
-                  ┌──────────────────────────────────────┐
-                  │  Target API (e.g. crAPI :8888)       │
-                  └──────────────────────────────────────┘
+                  ┌──────────────────────────────────┐
+                  │  apisec-sandbox container        │
+                  └──────────────────────────────────┘
+```
+
+Key opencode primitives used:
+
+- **Custom agents in `.opencode/agents/<name>.md`** — YAML frontmatter
+  declares `mode`, `description`, and a `permission` map that gates
+  every tool. The agent's body is its system prompt. opencode reads
+  these from `<workspace>/.opencode/agents/`; `run.sh` installs them as
+  per-file symlinks at start and cleans up on exit.
+- **MCP via `opencode.json`** — registered with `type: local` and an
+  absolute path to the bridge script. The agent sees the MCP's `bash`
+  tool as `apisec-sandbox_bash` (server-name prefix).
+- **Persistent server + `opencode run --attach`** — one `opencode serve`
+  is shared across all phases, so the prompt cache (the survey, the
+  source pack) hits across hunter and per-finding exploiter calls.
+- **Streaming JSON-line output** — `opencode run --format json` emits
+  `step_start`, `tool_use`, `text`, `step_finish` events; `run.sh`
+  reconstructs the final response by concatenating the `text` events.
+
+## Strategy 2: Claude Code
+
+`claude/README.md` has the full quickstart. Architectural view:
+
+```
+   per phase: claude -p --agent <name> --mcp-config <run>/mcp.json --strict-mcp-config
                                │
-   exploiter ─▶  per-finding loop ─▶ verdicts/<id>.json (CONFIRMED|FAILED|UNCLEAR)
+                               ▼
+   surveyor ──▶  Read / Grep / Glob / LS                  ──▶  survey.json
+                 (no Bash, no Edit, no Write, no WebFetch)
+
+   hunter   ──▶  Read / Grep / Glob / LS                  ──▶  findings.json
+                 mcp__apisec_sandbox__bash  — ALLOWED
+                 (no native Bash)
+
+   exploiter ─▶  Read / Grep / Glob                       ──▶  verdicts/<id>.json
+                 mcp__apisec_sandbox__bash  — ALLOWED
+                                │
+                                ▼
+                  ┌──────────────────────────────────┐
+                  │  MCP bridge (stdio JSON-RPC)     │
+                  │  python3 apisec-bridge.py        │
+                  └──────────────┬───────────────────┘
+                                 │ podman exec apisec-sandbox bash -lc ...
+                                 ▼
+                  ┌──────────────────────────────────┐
+                  │  apisec-sandbox container        │
+                  └──────────────────────────────────┘
 ```
 
-What each piece is doing:
+Key Claude Code primitives used:
 
-- **Custom agents (`opencode/agents/*.md`)** — opencode reads these from
-  `<workspace>/.opencode/agents/` (we install per-file symlinks at run
-  time). Each agent's YAML frontmatter sets `permission` rules that
-  whitelist exactly the tools it needs and deny the rest. The hunter and
-  exploiter both have `bash: deny` (no host shell) and
-  `apisec-sandbox_bash: allow` (only the sandboxed shell). The native
-  `read`/`grep`/`glob` are kept for static analysis on the read-only
-  source tree.
-
-- **MCP server (`opencode/mcp/apisec-bridge.py`)** — a small stdio
-  JSON-RPC bridge (~200 lines, stdlib only). opencode spawns it on
-  startup and discovers its `bash` tool. Each `tools/call` becomes
-  `podman exec apisec-sandbox bash -lc "<cmd>"` against the running
-  container; output (truncated to 64 KB) returns as the tool result.
-
-- **Sandbox container (`docker/apisec-runner/`)** — a Debian-slim image
-  with the API hacking toolkit (curl, httpie, jwt_tool, jwt-cli, sqlmap,
-  ffuf, gobuster, kr, arjun, python httpx/pyjwt/cryptography, jq, db
-  clients, SecLists wordlists). The project source is mounted read-only
-  at `/workspace`. `/sandbox` is a writable tmpfs (200 MB) for exploit
-  scripts and attacker-controlled servers. The container reads
-  `/sandbox/TOOLS.md` on first call to learn its environment and recipes.
-
-- **Cross-finding context** — running each agent through one shared
-  `opencode serve` lets the prompt-cache hit rate stay high (the survey
-  is 30k+ tokens of source context that gets reused across hunter calls
-  and across all per-finding exploiter calls). A 10-finding run lands
-  around `$0.05–$0.15` total with DeepSeek-V4-Pro.
-
-- **Why a sandbox at all** — the agent freely runs `curl`, custom Python
-  scripts, attacker-controlled HTTP listeners on tmpfs ports, etc. Doing
-  that against a target on the host means the agent's "hands" need to
-  be somewhere we can throw away — read-only filesystem + tmpfs scratch
-  + a fixed toolkit. The container is destroyed at the end of every run.
-
-### How the Claude Code strategy works
-
-Same shape as opencode — three subagents in markdown files, the same MCP
-bridge proxying into the same `apisec-sandbox` container — but using
-Claude Code's native primitives:
-
-- **Subagents** in `claude/agents/<name>.md`. The YAML frontmatter has
-  `name`, `description`, and a `tools` whitelist. Anything not listed is
-  unavailable to the agent — so the hunter / exploiter cannot invoke
-  native `Bash`/`Edit`/`Write`/`WebFetch`, only the MCP-provided
-  `mcp__apisec_sandbox__bash`. The body of the markdown file is the
-  agent's system prompt.
-
-- **MCP via `--mcp-config`** — `run.sh` generates a per-run `mcp.json`
-  with an absolute path to the shared `apisec-bridge.py` and passes it
-  to Claude with `--strict-mcp-config` so only the apisec-sandbox MCP
-  is loaded (no global servers leak in).
-
+- **Subagents in `.claude/agents/<name>.md`** — YAML frontmatter declares
+  `name`, `description`, and a `tools` whitelist. Anything not in the
+  whitelist is unavailable to the agent: omitting `Bash` is enough to
+  remove host shell access. The body of the markdown file is the
+  system prompt. `run.sh` installs them as per-file symlinks under
+  `<workspace>/.claude/agents/`.
+- **MCP via `--mcp-config <file> --strict-mcp-config`** — `run.sh`
+  generates a per-run `mcp.json` with an absolute path to the bridge
+  and passes it to Claude. `--strict-mcp-config` ensures only this MCP
+  is loaded (no globals leak in). The MCP's `bash` tool is exposed to
+  agents as `mcp__apisec_sandbox__bash`.
 - **Per-call invocation** — each phase is a separate `claude -p
-  --agent <name>` call, with `--add-dir <workspace>` so the agent's host
-  filesystem cwd matches the container's `/workspace` mount. The agents
-  are installed under `<workspace>/.claude/agents/` as per-file symlinks
-  at run start and removed at run end.
-
-- **Stream parsing** — `--output-format stream-json` produces newline-
-  delimited events (`system`, `assistant`, `user`, `result`). `run.sh`
+  --agent <name>` process. No persistent server; per-call cold-start
+  is the trade-off for simpler orchestration.
+- **Streaming via `--output-format stream-json`** — emits `system`,
+  `assistant`, `user` (tool_results), and `result` events. `run.sh`
   reconstructs the final response by concatenating every `text` block
-  inside `assistant` events.
+  inside `assistant` events. `claude/watch.sh` pretty-prints the same
+  stream live in another terminal.
 
-The bridge script and the `apisec-runner` container image are reused
-verbatim — only the agent definitions and orchestration glue change.
+## Side-by-side comparison
 
-### Codex strategy (planned)
+|                            | opencode                                    | Claude Code                                    |
+|----------------------------|---------------------------------------------|------------------------------------------------|
+| Agent definition           | `.opencode/agents/<name>.md`                | `.claude/agents/<name>.md`                     |
+| Tool gating                | `permission` map in frontmatter             | `tools` whitelist in frontmatter               |
+| MCP tool name              | `apisec-sandbox_bash`                       | `mcp__apisec_sandbox__bash`                    |
+| MCP registration           | `opencode.json` `mcp` block                 | `--mcp-config <file> --strict-mcp-config`      |
+| Server lifetime            | `opencode serve` shared across phases       | one process per phase                          |
+| Stream format              | flat (`type: text \| tool_use \| step_finish`)   | wrapped (`assistant.message.content[].type`)   |
+| Per-call cost              | warm cache after phase 1                    | full cold-start each call                      |
+| Skip permission prompts    | `--dangerously-skip-permissions`            | `--dangerously-skip-permissions`               |
 
-Same external contract: `run.sh` produces `survey.json`, `findings.json`,
-and one `verdicts/<id>.json` per finding. Codex has a built-in sandbox
-mode and tool-spec config; we wire those instead of writing a new MCP.
+---
 
-## Repository layout
+## Adding a new coding agent strategy
 
-```text
-.
-├── docker/
-│   ├── apisec-runner/         # sandbox image + TOOLS.md (shared by opencode + claude)
-│   └── poc-runner/            # legacy — Python PoC sandbox used by scripts/02_verify.py
-├── opencode/                  # opencode strategy (see opencode/README.md)
-├── claude/                    # Claude Code strategy (see claude/README.md)
-├── findings/                  # candidate JSONs, verified runs, opencode-runs/, claude-runs/
-├── scripts/                   # legacy Python orchestrator (Claude/Codex/opencode CLI)
-│   ├── 01_detect.py
-│   ├── 02_verify.py
-│   ├── 03_demo.py
-│   ├── api.py
-│   ├── common.py
-│   ├── models.py
-│   └── sandbox_mcp.py
-├── pyproject.toml
-└── uv.lock
+The contract every strategy must honor:
+
+1. Live in its own top-level folder `<agent>/`.
+2. Reuse `docker/apisec-runner/` as-is (mount source RO at `/workspace`,
+   tmpfs at `/sandbox`).
+3. Reuse `opencode/mcp/apisec-bridge.py` as the MCP backend (link or
+   copy). The bridge is stdlib-Python only; no dependencies.
+4. Provide an executable `run.sh` with at minimum these flags:
+   `--target-url`, `--workspace`, `--model`, `--findings <path>` (skip
+   survey + hunter), `--skip-build`, `--keep-container`.
+5. Produce these outputs under `findings/<agent>-runs/<timestamp>/`:
+   `survey.json`, `findings.json`, `verdicts/<id>.json`, plus the raw
+   per-phase `*.jsonl` streams for debugging.
+6. Translate the **same** three system prompts (the body of
+   `opencode/agents/{surveyor,hunter,exploiter}.md`) into whatever
+   format the new agent expects (a JSON object, a markdown frontmatter,
+   a CLI flag, …).
+
+Suggested skeleton when adding a new one:
+
 ```
+<agent>/
+├── agents/                 # or wherever the agent's prompt lives
+│   ├── surveyor.md
+│   ├── hunter.md
+│   └── exploiter.md
+├── mcp/
+│   └── apisec-bridge.py    # symlink → ../../opencode/mcp/apisec-bridge.py
+├── run.sh
+├── watch.sh                # optional but recommended
+└── README.md               # how the strategy maps to the agent's primitives
+```
+
+Things that will probably differ between strategies:
+
+- **MCP registration**. Some agents use a config file, others a CLI flag.
+- **Tool naming convention**. opencode uses `<server>_<tool>`,
+  Claude uses `mcp__<server>__<tool>`. Double-check on first run.
+- **Tool gating**. opencode uses a `permission` map, Claude uses a `tools`
+  whitelist, others may use roles. The agent's frontmatter is the natural
+  home if available; otherwise fall back to CLI flags.
+- **Stream format**. Each agent emits a different JSON shape; `run.sh`'s
+  parser block has to match.
+
+---
 
 ## Requirements
 
-- Python 3.12, `uv`
-- One coding agent CLI on `PATH`:
-  - `claude` (Claude Code), or
-  - `codex` (OpenAI Codex) + Node.js, or
-  - `opencode`
-- Podman + `podman compose` or `podman-compose` (only required for the
-  sandbox PoC path)
+- `podman` (rootless works) + `podman build` / `podman run`
+- `python3` (used by the MCP bridge and orchestrator helpers — only
+  stdlib, no virtualenv needed)
+- The CLI for the strategy you want to use:
+  - `opencode` ≥ 1.14.31 for the opencode strategy.
+  - `claude` (Claude Code CLI) for the claude strategy.
 
-If a CLI lives in a Toolbox container while Podman runs on the base system,
-override the launcher with `CLAUDE_COMMAND` / `CODEX_COMMAND` /
-`OPENCODE_COMMAND`.
+## Live setup (target)
 
-## Install
-
-```bash
-uv sync
-```
-
-If your environment has a read-only global uv cache:
-
-```bash
-UV_CACHE_DIR=/tmp/uv-cache uv sync
-```
-
-## Cache mode (no LLM, no target)
-
-Deterministic walk-through of the flow without the LLM, crAPI, network, or
-Podman:
-
-```bash
-uv run python scripts/03_demo.py --from-cache --no-pause
-```
-
-Expected:
-
-```text
-Metrics: 2 confirmed, 1 unclear, 0 failed.
-```
-
-Drop `--no-pause` to step through each stage.
-
-## Live setup
-
-Clone the target into the repo root:
+The default target wired into the prompts is OWASP crAPI, an intentionally
+vulnerable Java/Spring app with deliberate OWASP API Top 10 issues. Other
+intentionally-vulnerable apps (WebGoat, VAmPI, Juice Shop, DVWS) work too
+— at most you'd tweak the `--scope` hint passed to the surveyor.
 
 ```bash
 git clone https://github.com/OWASP/crAPI.git
-```
-
-Start it:
-
-```bash
 cd crAPI/deploy/docker
 podman compose -f docker-compose.yml up -d
+curl -i http://localhost:8888       # expect HTTP 200
 ```
 
-Verify:
+## Quickstart
 
-```bash
-curl -i http://localhost:8888
-```
+### opencode + DeepSeek-V4-Pro
 
-(Override the URL with `--target-url` when running against a different
-deployment.)
-
-## Build the PoC sandbox image (optional)
-
-Only needed for the sandbox PoC path. Skip for the direct-execution path
-used by `--use-api`.
-
-```bash
-podman build -t strike-demo/poc-runner:latest docker/poc-runner
-```
-
-The image contains Python, `httpx`, `requests`, `curl`, `jq`. PoCs run with
-read-only filesystem, memory/PID limits, and `TARGET_URL` injected as env.
-
-## End-to-end with Claude
-
-```bash
-uv run python scripts/03_demo.py \
-  --service identity \
-  --max-findings 3 \
-  --target-url http://localhost:8888 \
-  --llm claude \
-  --model claude-opus-4-7 \
-  --detect-timeout 1800 \
-  --codex-timeout 1800 \
-  --runtime podman \
-  --no-pause
-```
-
-## End-to-end with DeepSeek via opencode
-
-DeepSeek-V4-Pro through opencode, using the persistent-server path so the
-agent can `curl` directly against the target without a Python sandbox in the
-middle:
-
-```bash
-uv run python scripts/03_demo.py \
-  --llm opencode --use-api \
-  --model deepseek/deepseek-v4-pro \
-  --candidates findings/candidates-f002-f003.json \
-  --no-pause
-```
-
-The opencode provider config (in `~/.config/opencode/opencode.json`) needs
-the DeepSeek provider and the auto-allow permission rules for `bash`,
-`external_directory`, `webfetch` so the agent can drive curl without prompts.
+DeepSeek-V4-Pro is interesting because it's cheap (~$0.01 per finding) and
+supports tool calling reliably through opencode. Configure the provider
+once in `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -552,7 +387,7 @@ the DeepSeek provider and the auto-allow permission rules for `bash`,
       "name": "DeepSeek",
       "options": {
         "baseURL": "https://api.deepseek.com",
-        "apiKey": "..."
+        "apiKey": "sk-..."
       },
       "models": {
         "deepseek-v4-pro": {
@@ -565,122 +400,168 @@ the DeepSeek provider and the auto-allow permission rules for `bash`,
 }
 ```
 
-## End-to-end with Codex
+Then:
 
 ```bash
-uv run python scripts/03_demo.py \
-  --service identity \
-  --max-findings 3 \
-  --target-url http://localhost:8888 \
-  --llm codex \
-  --model gpt-5.5 \
-  --detect-timeout 1800 \
-  --codex-timeout 1800 \
-  --runtime podman \
-  --no-pause
+opencode/run.sh \
+    --target-url http://localhost:8888 \
+    --workspace ./crAPI \
+    --model deepseek/deepseek-v4-pro
 ```
 
-## Seeded candidates (skip detect)
-
-Useful when iterating on the verify path or running a reliable timed walk-through.
+### Claude Code
 
 ```bash
-uv run python scripts/03_demo.py \
-  --candidates findings/candidates-f002-f003.json \
-  --max-findings 2 \
-  --target-url http://localhost:8888 \
-  --llm opencode --use-api \
-  --model deepseek/deepseek-v4-pro \
-  --no-pause
+claude/run.sh \
+    --target-url http://localhost:8888 \
+    --workspace ./crAPI \
+    --model claude-sonnet-4-6
 ```
+
+### Skip survey + hunter, only verify
+
+Both strategies accept `--findings <path-to-findings.json>`. Useful when
+iterating on the exploiter, or running the same findings against a target
+that's been re-deployed.
+
+```bash
+opencode/run.sh ... \
+    --findings findings/opencode-runs/20260503-063112/findings.json
+```
+
+### Watching live progress
+
+`claude/watch.sh` pretty-prints the live stream-json events from any phase:
+
+```bash
+claude/watch.sh                   # auto-detect the active phase
+claude/watch.sh hunter            # specific phase
+claude/watch.sh --run 20260503-072300   # past run
+```
+
+For opencode, attach the TUI to the running serve:
+
+```bash
+opencode attach http://localhost:4096 --dir ./crAPI
+```
+
+---
 
 ## Outputs
 
-Every run produces:
+Every run writes to `findings/<agent>-runs/<timestamp>/`:
 
-- `findings/candidates-<timestamp>.json` — detect output
-- `findings/verified-<timestamp>.json` — per-finding verdicts + evidence
-- `findings/demo-run-<timestamp>.json` — full reproducible run record
-- `findings/runs/run-<timestamp>.json` — partial state, written continuously
-  during the run; `tail -f` it from another terminal to follow progress
+```
+survey.json           # surveyor output
+findings.json         # hunter output
+verdicts/<id>.json    # one per finding from the exploiter
+*.jsonl               # raw streamed events from each phase
+```
+
+The verdict schema is:
+
+```
+{
+  "status": "CONFIRMED | FAILED | UNCLEAR",
+  "evidence": "concise narrative of HTTP evidence",
+  "requests": [
+    {"method": "POST", "url": "...", "status": 200, "body_excerpt": "..."}
+  ],
+  "reason": "why this verdict follows from the evidence"
+}
+```
 
 ## Operational fields on every finding
 
-The detect step does not just emit "there's a BOLA in foo.java". Each finding
-carries:
+The hunter does not just emit "there's a BOLA in foo.java". Each finding
+carries enough detail for an automated exploit generator to act on:
 
 - `victim_identity` — who the exploit targets / impersonates.
 - `attack_request` — method, path, headers, body, notes.
-- `expected_response_signal` — concrete substring/field that proves the bug
-  fired.
+- `expected_response_signal` — concrete substring/field that proves the
+  bug fired.
 - `setup_state` — steps the PoC runs before the attack (signup, login).
-- `target_state_required` — preexisting target state the PoC cannot create
-  itself (seed users, fixed UUIDs); `null` means self-sufficient.
+- `target_state_required` — preexisting target state the PoC cannot
+  create itself (seed users, fixed UUIDs); `null` means self-sufficient.
 
-These are authoritative for the verifier — it builds the exploit directly
+These are authoritative for the exploiter — it builds the exploit directly
 from them rather than improvise.
 
-## Useful commands
+## Example target: crAPI architecture (reference)
 
-```bash
-uv run ruff check .
-uv run ruff format .
-```
+```mermaid
+flowchart TB
+    subgraph host["Local host"]
+        agent["Coding agent on host<br/>(brain)"]
+        sandbox["apisec-sandbox container<br/>(hands)"]
+        agent -- MCP / podman exec --> sandbox
+    end
 
-Run the sandbox directly against an existing PoC:
+    subgraph crapi["OWASP crAPI (Podman Compose)"]
+        web["crapi-web<br/>OpenResty / Web UI<br/>localhost:8888"]
+        identity["crapi-identity<br/>Java<br/>users, auth, JWT, OTP, vehicles"]
+        workshop["crapi-workshop<br/>Python<br/>mechanics, services, orders"]
+        community["crapi-community<br/>Go<br/>posts, comments, coupons"]
+        chatbot["crapi-chatbot<br/>assistant"]
+        mailhog["mailhog<br/>localhost:8025"]
+        postgres[("postgresdb")]
+        mongo[("mongodb")]
+    end
 
-```bash
-uv run python scripts/sandbox_mcp.py run poc.py \
-  --target-url http://localhost:8888 \
-  --runtime podman
+    sandbox -- HTTP --> web
+    web --> identity
+    web --> workshop
+    web --> community
+    web --> chatbot
+    identity --> postgres
+    identity --> mongo
+    workshop --> postgres
+    workshop --> mongo
+    community --> postgres
+    community --> mongo
 ```
 
 ## Troubleshooting
 
-### `podman` not found / `podman compose` not available
+### `podman build` fails
 
-```bash
-command -v podman
-podman-compose -f docker-compose.yml up -d   # fallback
-```
+The Dockerfile downloads single-file binaries (jwt-cli, ffuf, gobuster,
+kr) from GitHub releases. If your network is constrained, those URLs are
+the points of failure — you'll see a `curl` non-zero exit. Either retry
+or pin to a mirror.
 
-### crAPI is unreachable
+### Container can't reach the target
 
-```bash
-podman ps
-curl -i http://localhost:8888
-```
+`run.sh` uses `--network=host`. If your target is bound to a different
+interface than `localhost:<port>`, pass `--target-url http://<that>:<port>`.
 
-### LLM is slow or unavailable
+### MCP tool not found
 
-Cache mode:
+Most likely the bridge failed to start.
+- opencode: `cd <workspace> && opencode mcp list` shows the status.
+- Claude: `cat findings/claude-runs/<ts>/*.err` has Claude's MCP startup
+  errors.
+- Run the bridge manually: `python3 opencode/mcp/apisec-bridge.py` —
+  it should sit waiting for stdin (Ctrl-C to exit).
 
-```bash
-uv run python scripts/03_demo.py --from-cache
-```
+### Agent calls native bash anyway
 
-### Claude refuses a specific finding
+Check the agent's frontmatter:
+- opencode: `permission.bash: deny`.
+- Claude: don't list `Bash` in `tools`.
 
-The verifier catches refusals, marks the finding as `UNCLEAR` with the error
-in evidence, and continues. For consistent refusals, rephrase the hypothesis
-(avoid "any user including admin" language) or fall back to `--llm codex` /
-`--llm opencode`.
+### "agent not found"
 
-### opencode + DeepSeek silently does not run tools
+The agent files are installed under `<workspace>/.opencode/agents/` or
+`<workspace>/.claude/agents/` at run start. If `run.sh` crashed early
+they may be missing — re-run, the cleanup trap is idempotent. opencode
+specifically does **not** follow directory symlinks for project-config
+discovery; we use per-file symlinks for that reason.
 
-If you see lots of streamed text but no tool calls, two common causes:
+### Tail of the run says all verdicts are MALFORMED
 
-1. The DeepSeek model is configured as a reasoning model in opencode config
-   (`reasoning: true`, `thinking: { type: "enabled" }`) — reasoning variants
-   may not emit tool calls. Try `deepseek-v4-flash` or remove the reasoning
-   flags.
-2. Permission gates are blocking `bash` / `external_directory`. Add the
-   `permission` block shown above to your opencode config.
-
-### Codex stuck on approval prompts
-
-```bash
-CODEX_EXEC_FLAGS="--dangerously-bypass-approvals-and-sandbox" uv run python ...
-```
-
-Use only against authorized, intentionally-vulnerable local targets.
+The exploiter runs but produced 0-byte verdicts. Most often this is a
+stream-parser mismatch (the agent emitted a different JSON shape than
+the parser expects). The full stream is preserved in the run's
+`exploiter.jsonl`, and `findings/<agent>-runs/<ts>/exploiter.jsonl` can
+be re-parsed offline to recover verdicts.

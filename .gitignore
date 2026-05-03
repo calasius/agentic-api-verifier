@@ -1,14 +1,16 @@
-.venv/
-.codex
+# Editor / language caches
 __pycache__/
 *.pyc
 .ruff_cache/
-findings/candidates-*.json
-findings/verified-*.json
-findings/demo-run-*.json
-findings/runs/*.json
+.venv/
+
+# Per-strategy run output (gitignored — recreate by re-running)
 findings/opencode-runs/
 findings/claude-runs/
-crAPI/
+
+# Per-run agent + MCP installs into the target workspace, cleaned up by run.sh
 .opencode/
 .claude/
+
+# The target source tree (cloned separately, do not commit)
+crAPI/
