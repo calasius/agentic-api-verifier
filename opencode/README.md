@@ -86,29 +86,29 @@ opencode-serve.log
 
 ## Watching progress live
 
-In a second terminal, while `run.sh` is going:
+`opencode/watch.sh` auto-discovers the currently-running phase and
+attaches to it via the native opencode TUI. In a second terminal:
 
 ```bash
-opencode/watch.sh                  # auto-detect the active phase
-opencode/watch.sh surveyor         # surveyor only
-opencode/watch.sh hunter           # hunter only
-opencode/watch.sh exploiter        # the per-finding exploiter loop
-opencode/watch.sh --run 20260503-072300   # specific past run
+opencode/watch.sh                  # active phase, latest run, default port
+opencode/watch.sh --port 4097      # if run.sh used a non-default port
+opencode/watch.sh hunter           # force a specific phase
+opencode/watch.sh --run 20260503-072300  # past run by timestamp
 ```
 
-The watcher pretty-prints the JSON-line stream:
-- `⚙ <tool> :: <input>` tool call (Read/Grep/Bash/MCP/...)
-- `   ↳ <output>` tool result excerpt
-- `💬 <text>` text chunk from the assistant
-- `✓ step_finish  cost=$…  in=… out=…  cache_read=…` per-step usage
+What it does:
+1. Finds the latest run dir under `findings/opencode-runs/` (or the one
+   you passed with `--run`).
+2. Picks the most recently updated `*.jsonl` — during the exploiter loop
+   that's `exploiter-tmp.jsonl` (the per-finding stream that gets
+   appended to `exploiter.jsonl` once each verification ends).
+3. Extracts the last `sessionID` from that file.
+4. Queries the running opencode serve for that session's `directory`.
+5. `exec`s `opencode attach <url> --session <sid> --dir <directory>` —
+   you land in the live TUI for that phase.
 
-If you prefer the native opencode TUI:
-
-```bash
-opencode attach http://localhost:4096 --dir <workspace>
-```
-
-The TUI lists active sessions; pick the one you want to follow.
+Rerun the script when the exploiter advances to the next finding (each
+finding is a new opencode session).
 
 ## How the agents are wired
 
