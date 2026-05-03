@@ -137,46 +137,32 @@ run_agent() {
     local prompt="$2"
     local out_file="$3"
 
-    # `claude -p --agent <name>` runs the named agent (defined in
-    # $WORKSPACE/.claude/agents/<name>.md) over the given user prompt and
-    # streams JSON events to stdout. We pass --strict-mcp-config so only
-    # the MCP we generate is loaded (no globals leak in).
-    claude -p \
+    # `claude -p --agent <name>` looks for project-local agents at
+    # `<cwd>/.claude/agents/<name>.md` — NOT under --add-dir. We `cd` into
+    # $WORKSPACE_DIR (where the per-file symlinks live) inside a subshell
+    # so the host filesystem cwd matches the container's /workspace mount
+    # AND Claude's agent discovery finds our agents.
+    ( cd "$WORKSPACE_DIR" && claude -p \
         --output-format stream-json \
         --include-partial-messages \
         --verbose \
         --agent "$agent" \
-        --add-dir "$WORKSPACE_DIR" \
         --mcp-config "$MCP_CFG" \
         --strict-mcp-config \
         --model "$MODEL" \
         --max-turns "$MAX_TURNS" \
         --dangerously-skip-permissions \
-        "$prompt" \
+        "$prompt" ) \
         > "$RUN_DIR/${agent}.jsonl" 2>"$RUN_DIR/${agent}.err"
 
-    # Concatenate all assistant text content blocks (skipping tool_use)
-    # to reconstruct the final response, then strip optional ```json fences.
-    python3 - "$RUN_DIR/${agent}.jsonl" > "$out_file" <<'PY'
-import json, re, sys
-text_parts = []
-with open(sys.argv[1]) as f:
-    for line in f:
-        line = line.strip()
-        if not line: continue
-        try: ev = json.loads(line)
-        except json.JSONDecodeError: continue
-        if ev.get("type") != "assistant": continue
-        msg = ev.get("message", {}) or {}
-        for block in msg.get("content", []) or []:
-            if isinstance(block, dict) and block.get("type") == "text":
-                t = block.get("text", "")
-                if isinstance(t, str): text_parts.append(t)
-text = "\n".join(text_parts).strip()
-m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
-if m: text = m.group(1)
-sys.stdout.write(text)
-PY
+    # Multi-strategy verdict extraction (full-parse, fenced, balanced-brace,
+    # shape-aware). Pass `findings` for surveyor/hunter, `status` for
+    # exploiter (caller decides via $4).
+    local want_key="${4:-}"
+    python3 "$REPO_ROOT/claude/parse-stream.py" \
+        "$RUN_DIR/${agent}.jsonl" \
+        "$want_key" \
+        > "$out_file"
 }
 
 if [[ -n "$FINDINGS_INPUT" ]]; then
@@ -195,7 +181,7 @@ ${SCOPE_HINT:+Scope hint: $SCOPE_HINT. }\
 Return the JSON structure described in your system prompt and nothing else."
 
     log "Running surveyor …"
-    run_agent surveyor "$SURVEY_PROMPT" "$RUN_DIR/survey.json"
+    run_agent surveyor "$SURVEY_PROMPT" "$RUN_DIR/survey.json" stack
     SURVEY_BYTES=$(wc -c < "$RUN_DIR/survey.json")
     log "Survey written ($SURVEY_BYTES bytes): $RUN_DIR/survey.json"
 
@@ -212,7 +198,7 @@ The live target is reachable at \$TARGET_URL = $TARGET_URL from inside the sandb
 Use mcp__apisec_sandbox__bash for any HTTP probing or exploit scripts."
 
     log "Running hunter …"
-    run_agent hunter "$HUNTER_PROMPT" "$RUN_DIR/findings.json"
+    run_agent hunter "$HUNTER_PROMPT" "$RUN_DIR/findings.json" findings
     log "Findings written: $RUN_DIR/findings.json"
 fi
 
@@ -238,43 +224,24 @@ $FINDING
 </finding>"
 
     TMP_JSONL="$RUN_DIR/exploiter-tmp.jsonl"
-    claude -p \
+    ( cd "$WORKSPACE_DIR" && claude -p \
         --output-format stream-json \
         --include-partial-messages \
         --verbose \
         --agent exploiter \
-        --add-dir "$WORKSPACE_DIR" \
         --mcp-config "$MCP_CFG" \
         --strict-mcp-config \
         --model "$MODEL" \
         --max-turns "$MAX_TURNS" \
         --dangerously-skip-permissions \
-        "$PROMPT" \
+        "$PROMPT" ) \
         > "$TMP_JSONL" 2>>"$RUN_DIR/exploiter.err" || \
         log "  [$FID] claude exited non-zero (continuing)"
 
     cat "$TMP_JSONL" >> "$RUN_DIR/exploiter.jsonl"
 
-    python3 - "$TMP_JSONL" > "$RUN_DIR/verdicts/$FID.json" <<'PY'
-import json, re, sys
-text_parts = []
-with open(sys.argv[1]) as f:
-    for line in f:
-        line = line.strip()
-        if not line: continue
-        try: ev = json.loads(line)
-        except json.JSONDecodeError: continue
-        if ev.get("type") != "assistant": continue
-        msg = ev.get("message", {}) or {}
-        for block in msg.get("content", []) or []:
-            if isinstance(block, dict) and block.get("type") == "text":
-                t = block.get("text", "")
-                if isinstance(t, str): text_parts.append(t)
-text = "\n".join(text_parts).strip()
-m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
-if m: text = m.group(1)
-sys.stdout.write(text)
-PY
+    python3 "$REPO_ROOT/claude/parse-stream.py" "$TMP_JSONL" status \
+        > "$RUN_DIR/verdicts/$FID.json"
 
     rm -f "$TMP_JSONL"
 done
